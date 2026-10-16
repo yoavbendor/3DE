@@ -95,6 +95,7 @@
   </script>
 </head>
 <body>
+  <div id="version" style="font:12px/1.4 ui-monospace,Menlo,Consolas,monospace;color:#9a9ca3;margin-top:12px"></div>
   <h1>Object to 3D</h1>
   <p class="lead">Take a few photos of an object from different sides, or pick a short video. Depth Anything 3 (small) runs on this device and builds a point cloud you can rotate.</p>
 
@@ -157,7 +158,7 @@
     import { OrbitControls } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js";
 
     // ---------- constants ----------
-    const BUILD = "debug-6";
+    const BUILD = "debug-7";
     // Must match --res passed to tools/export_onnx.py. One view or two use the
     // full 504 model; three or more use the 336 model, because attention memory
     // grows with (views x tokens)^2 and phones run out of memory at 504.
@@ -190,6 +191,7 @@
     const downloadBtn = $("download");
     const resetBtn = $("reset");
     const copyBtn = $("copyDebug");
+    const versionEl = $("version");
     const copyState = $("copyState");
     const debugDetails = $("debugDetails");
     const debugText = $("debugText");
@@ -200,6 +202,35 @@
     let pendingSources = null; // picked photos/frames waiting for the Generate button
     let busy = false;
     let runCounter = 0;
+
+    // ---------- version bar ----------
+    // Shows which build this tab runs. It also fetches the files from the server
+    // without the cache, so a stale tab says so.
+    const loadedAt = new Date().toLocaleTimeString();
+    let workerBuild = "starting";
+    let serverBuild = null;
+    let serverWorkerBuild = null;
+    function paintVersion() {
+      let check = "checking server…";
+      if (serverBuild !== null) {
+        const pageOk = serverBuild === BUILD;
+        const workerOk = workerBuild === "starting" || serverWorkerBuild === null || serverWorkerBuild === workerBuild;
+        check = pageOk && workerOk
+          ? "up to date"
+          : `NEWER VERSION ON SERVER (page ${serverBuild}, worker ${serverWorkerBuild}). Close the tab and reopen.`;
+      }
+      versionEl.textContent = `Build ${BUILD} · loaded ${loadedAt} · worker ${workerBuild} · ${check}`;
+      versionEl.style.color = check.startsWith("NEWER") ? "#ff8a8a" : "#9a9ca3";
+    }
+    paintVersion();
+    Promise.all([
+      fetch("index.html", { cache: "no-store" }).then((r) => r.text()),
+      fetch("worker.js", { cache: "no-store" }).then((r) => r.text()),
+    ]).then(([html, js]) => {
+      serverBuild = (html.match(/const BUILD = "([^"]+)"/) || [])[1] ?? "unknown";
+      serverWorkerBuild = (js.match(/const WORKER_BUILD = "([^"]+)"/) || [])[1] ?? "unknown";
+      paintVersion();
+    }).catch(() => { serverBuild = "unreachable"; paintVersion(); });
 
     // ---------- debug log (survives a tab crash: written to localStorage on every event) ----------
     const SESSION = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-") + "-" + Math.random().toString(36).slice(2, 6);
@@ -423,6 +454,10 @@
         const m = e.data;
         if (m.type === "log") {
           log(m.level, m.msg, m.data, "worker");
+          if (m.msg === "worker started" && m.data) {
+            workerBuild = m.data.build;
+            paintVersion();
+          }
           if (m.msg === "worker started" && m.data && m.data.build !== BUILD) {
             log("error", "page and worker builds differ", { page: BUILD, worker: m.data.build });
             setStatus(`Old worker file is still cached (worker ${m.data.build}, page ${BUILD}). Close the tab and reopen the page.`, true);
