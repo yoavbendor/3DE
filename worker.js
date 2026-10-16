@@ -12,6 +12,7 @@ importScripts("https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.min.
 ort.env.wasm.numThreads = 1;
 ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/";
 
+const WORKER_BUILD = "debug-3";
 const RES = 504;
 const MODEL_URL = "model/da3-small-fp16.onnx";
 const OUTPUTS = ["depth", "depth_conf", "extrinsics", "intrinsics"];
@@ -171,4 +172,4 @@ self.onmessage = async (e) => {
   }
 };
 
-log("info", "worker started", { userAgent: navigator.userAgent });
+log("info", "worker started", { build: WORKER_BUILD, userAgent: navigator.userAgent });

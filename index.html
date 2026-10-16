@@ -157,7 +157,7 @@
     import { OrbitControls } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js";
 
     // ---------- constants ----------
-    const BUILD = "debug-2";
+    const BUILD = "debug-3";
     // Must match --res passed to tools/export_onnx.py
     const RES = 504;
     const P = RES * RES;
@@ -411,10 +411,17 @@
     }
 
     function createWorker() {
-      worker = new Worker("worker.js");
+      worker = new Worker(`worker.js?v=${BUILD}`);
       worker.onmessage = (e) => {
         const m = e.data;
-        if (m.type === "log") { log(m.level, m.msg, m.data, "worker"); return; }
+        if (m.type === "log") {
+          log(m.level, m.msg, m.data, "worker");
+          if (m.msg === "worker started" && m.data && m.data.build !== BUILD) {
+            log("error", "page and worker builds differ", { page: BUILD, worker: m.data.build });
+            setStatus(`Old worker file is still cached (worker ${m.data.build}, page ${BUILD}). Close the tab and reopen the page.`, true);
+          }
+          return;
+        }
         const req = pending.get(m.id);
         if (!req) return;
         if (m.type === "progress") { req.onProgress?.(m); return; }
