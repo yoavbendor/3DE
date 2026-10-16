@@ -1,6 +1,6 @@
 // Runs the ONNX model off the main thread so the page stays responsive.
 // In:  {id, type:'load', prefer} | {id, type:'run', input, V, prefer}
-//      res: 504 | 252 | 224 (picks the model file), prefer: "auto" (WebGPU, then CPU) | "webgpu" | "cpu"
+//      H, W: input size (multiples of 14), prefer: "auto" (WebGPU, then CPU) | "webgpu" | "cpu"
 // Out: {type:'log', level, msg, data}                      (diagnostics, any time)
 //      {id, type:'progress', done, total} | {id, type:'progress', phase:'infer'}
 //      {id, type:'done', backend, result?, stats?, timings?}
@@ -12,14 +12,10 @@ importScripts("https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.min.
 ort.env.wasm.numThreads = 1;
 ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/";
 
-const WORKER_BUILD = "debug-11";
-// Model file per input size. The page picks the size per run (planRun in index.html).
-const MODELS = {
-  504: "model/da3-small-fp16.onnx",
-  336: "model/da3-small-336-fp16.onnx",
-  252: "model/da3-small-252-fp16.onnx",
-  224: "model/da3-small-224-fp16.onnx",
-};
+const WORKER_BUILD = "debug-12";
+// One model with dynamic views, height and width (multiples of 14). The page
+// sends images at their own aspect ratio, as the upstream preprocessing does.
+const MODELS = { dyn: "model/da3-small-dyn-fp16.onnx" };
 const OUTPUTS = ["depth", "depth_conf", "extrinsics", "intrinsics"];
 
 const modelBytesByRes = {};
@@ -33,7 +29,7 @@ const round = (x) => Math.round(x * 1000) / 1000;
 const log = (level, msg, data) => postMessage({ type: "log", level, msg, data });
 
 async function openCache() {
-  try { return await caches.open("da3-model-v1"); } catch { return null; }
+  try { return await caches.open("da3-model-v2"); } catch { return null; }
 }
 
 async function getModelBytes(res, id) {
@@ -116,8 +112,8 @@ function statsOf(a) {
   return { n: a.length, nonFinite, min: round(min), max: round(max) };
 }
 
-async function infer(input, V, res, id) {
-  const feeds = { images: new ort.Tensor("float32", input, [1, V, 3, res, res]) };
+async function infer(input, V, H, W, id) {
+  const feeds = { images: new ort.Tensor("float32", input, [1, V, 3, H, W]) };
   postMessage({ id, type: "progress", phase: "infer" });
   const t = now();
   const out = await session.run(feeds);
@@ -130,19 +126,19 @@ async function infer(input, V, res, id) {
 async function run(m) {
   const timings = {};
   let t = now();
-  await ensureSession(m.prefer, m.res, m.id);
+  await ensureSession(m.prefer, "dyn", m.id);
   timings.sessionMs = round(now() - t);
 
   let fallback = null;
   let attempt;
   try {
-    attempt = await infer(m.input, m.V, m.res, m.id);
+    attempt = await infer(m.input, m.V, m.H, m.W, m.id);
   } catch (err) {
     if (sessionKind !== "webgpu") throw err;
     log("error", "WebGPU inference threw, retrying on CPU", { error: String((err && err.message) || err) });
     fallback = "webgpu-error";
-    await ensureSession("cpu", m.res, m.id);
-    attempt = await infer(m.input, m.V, m.res, m.id);
+    await ensureSession("cpu", "dyn", m.id);
+    attempt = await infer(m.input, m.V, m.H, m.W, m.id);
   }
 
   let stats = {};
@@ -151,8 +147,8 @@ async function run(m) {
   if (broken && sessionKind === "webgpu") {
     log("warn", "WebGPU produced NaN/Infinity, retrying on CPU", stats);
     fallback = "non-finite-output";
-    await ensureSession("cpu", m.res, m.id);
-    attempt = await infer(m.input, m.V, m.res, m.id);
+    await ensureSession("cpu", "dyn", m.id);
+    attempt = await infer(m.input, m.V, m.H, m.W, m.id);
     stats = {};
     for (const k of OUTPUTS) stats[k] = statsOf(attempt.result[k]);
   }
@@ -160,7 +156,7 @@ async function run(m) {
   timings.inferMs = attempt.ms;
   timings.backend = sessionKind;
   timings.fallback = fallback;
-  log("info", "inference finished", { backend: sessionKind, V: m.V, res: m.res, inferMs: attempt.ms, fallback, stats });
+  log("info", "inference finished", { backend: sessionKind, V: m.V, H: m.H, W: m.W, inferMs: attempt.ms, fallback, stats });
   return { result: attempt.result, stats, timings };
 }
 
@@ -168,7 +164,7 @@ self.onmessage = async (e) => {
   const m = e.data;
   try {
     if (m.type === "load") {
-      await ensureSession(m.prefer, m.res, m.id);
+      await ensureSession(m.prefer, "dyn", m.id);
       postMessage({ id: m.id, type: "done", backend: sessionKind });
     } else if (m.type === "run") {
       const r = await run(m);

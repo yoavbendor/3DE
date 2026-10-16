@@ -148,8 +148,8 @@
   </div>
 
   <p class="foot">
-    Runs fully on this device. The model file (<code>model/da3-small-fp16.onnx</code>) is downloaded once (about 56 MB) and cached by the browser.
-    Each photo is letterboxed to 504×504 so its proportions are kept. The cloud uses the model's own camera poses to place each view in one space.
+    Runs fully on this device. The model file (<code>model/da3-small-dyn-fp16.onnx</code>) is downloaded once (about 55 MB) and cached by the browser.
+    Each photo keeps its own aspect ratio (longest side 252–504 px, chosen to fit memory). The cloud uses the model's own camera poses to place each view in one space.
     Depth Anything 3 weights (DA3-SMALL) are Apache-2.0.
   </p>
 
@@ -158,36 +158,35 @@
     import { OrbitControls } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js";
 
     // ---------- constants ----------
-    const BUILD = "debug-11";
-    // Input sizes. Each must match a model exported with --res (multiple of 14).
-    const RES_ORDER = [504, 336, 252, 224];
-    // Two or more photos never go above this size: 336 px fits two photos under the
-    // budget, and 252 and 224 px cover three to five.
-    const MULTI_VIEW_MAX_RES = 336;
-    // Peak memory per run in MB, measured with onnxruntime-web on the CPU backend.
-    // Phone reference points: 1 view at 504 px (~820 MB) worked; 5 views at 336 px
-    // (~1210 MB) was killed. Budget is set at the known-good point.
+    const BUILD = "debug-12";
+    // Input size is the photo's longest side; the other side follows the photo's
+    // own aspect ratio (no padding), both rounded to multiples of 14, as the
+    // upstream preprocessing does. One model handles every size.
+    const LONG_SIDES = [504, 420, 336, 280, 252];
+    // Peak memory in MB for 4:3 photos (longest side -> views), measured with
+    // onnxruntime-web on the CPU backend. Phone reference: ~820 MB worked,
+    // ~1200 MB was killed, so the budget sits at the known-good level.
     const PEAK_MB = {
-      504: { 1: 818, 2: 1090 },
-      336: { 1: 640, 2: 732 },
-      252: { 1: 634, 2: 601, 3: 703, 4: 803, 5: 842 },
-      224: { 1: 608, 2: 610, 3: 658, 4: 737, 5: 720 },
+      504: { 1: 691, 2: 991, 3: 1173 },
+      420: { 1: 694, 2: 797, 3: 984 },
+      336: { 1: 647, 2: 703, 3: 762, 4: 895, 5: 1067 },
+      280: { 1: 694, 2: 692, 3: 709, 4: 773, 5: 806, 6: 899 },
+      252: { 1: 680, 2: 634, 3: 659, 4: 738, 5: 757, 6: 808 },
     };
     const MEM_BUDGET_MB = 820;
+    const MAX_RUN_VIEWS = 6;
     // Keep as many photos as possible, then use the largest size that fits the budget.
     function planRun(N) {
-      for (let V = Math.min(N, 5); V >= 1; V--) {
-        const sizes = V >= 2 ? RES_ORDER.filter((r) => r <= MULTI_VIEW_MAX_RES) : RES_ORDER;
-        for (const res of sizes) {
-          const peak = PEAK_MB[res][V];
-          if (peak !== undefined && peak <= MEM_BUDGET_MB) return { V, res, peakMB: peak };
+      for (let V = Math.min(N, MAX_RUN_VIEWS); V >= 1; V--) {
+        for (const longSide of LONG_SIDES) {
+          const peak = PEAK_MB[longSide][V];
+          if (peak !== undefined && peak <= MEM_BUDGET_MB) return { V, longSide, peakMB: peak };
         }
       }
-      return { V: 1, res: 224, peakMB: PEAK_MB[224][1] };
+      return { V: 1, longSide: 252, peakMB: PEAK_MB[252][1] };
     }
     const MAX_VIEWS = 8;
     const MAX_POINTS = 600000;
-    const PAD_GREY = "#808080";
     const MEAN = [0.485, 0.456, 0.406];
     const STD = [0.229, 0.224, 0.225];
     const LOG_KEY = "da3-debug-current";
@@ -555,38 +554,39 @@
       return sampleEvenly(sources, MAX_VIEWS);
     }
 
-    // Letterbox to RES x RES, keeping the photo's proportions. The padding is
-    // grey, and `inside` marks the real photo pixels so padding never becomes points.
-    function letterbox(src, res, canvas) {
-      const w = src.width, h = src.height;
-      const s = res / Math.max(w, h);
-      const dw = Math.round(w * s), dh = Math.round(h * s);
-      const ox = Math.floor((res - dw) / 2), oy = Math.floor((res - dh) / 2);
-      canvas.width = canvas.height = res;
-      const ctx = canvas.getContext("2d", { willReadFrequently: true });
-      ctx.fillStyle = PAD_GREY;
-      ctx.fillRect(0, 0, res, res);
-      ctx.drawImage(src, ox, oy, dw, dh);
-      return { ox, oy, dw, dh, ctx };
+    // Model input size for a photo: longest side = longSide, the other side
+    // from the photo's aspect ratio, both rounded to multiples of 14 (as upstream).
+    function inputSize(src, longSide) {
+      const s = longSide / Math.max(src.width, src.height);
+      const round14 = (v) => Math.max(14, Math.round(Math.round(v * s) / 14) * 14);
+      return { W: round14(src.width), H: round14(src.height) };
     }
 
-    function toView(src, res) {
+    // Resize a photo to W x H. Photos with another aspect ratio than the first
+    // one are centre-cropped to it first, because all views must share one size.
+    function toView(src, W, H) {
+      const want = W / H, have = src.width / src.height;
+      let cw = src.width, ch = src.height;
+      if (have > want) cw = src.height * want; else ch = src.width / want;
       const cv = document.createElement("canvas");
-      const { ox, oy, dw, dh, ctx } = letterbox(src, res, cv);
-      const inside = new Uint8Array(res * res);
-      for (let y = oy; y < oy + dh; y++) inside.fill(1, y * res + ox, y * res + ox + dw);
-      return { rgba: ctx.getImageData(0, 0, res, res).data, inside };
+      cv.width = W; cv.height = H;
+      const ctx = cv.getContext("2d", { willReadFrequently: true });
+      ctx.drawImage(src, (src.width - cw) / 2, (src.height - ch) / 2, cw, ch, 0, 0, W, H);
+      return { rgba: ctx.getImageData(0, 0, W, H).data };
     }
 
     function makeThumb(src) {
       const cv = document.createElement("canvas");
-      letterbox(src, 128, cv);
-      cv.style.width = cv.style.height = "64px";
+      const s = 128 / Math.max(src.width, src.height);
+      cv.width = Math.round(src.width * s); cv.height = Math.round(src.height * s);
+      cv.getContext("2d").drawImage(src, 0, 0, cv.width, cv.height);
+      cv.style.height = "64px"; cv.style.width = "auto";
       return cv;
     }
 
-    function buildInput(views, RES, P) {
+    function buildInput(views, H, W) {
       const V = views.length;
+      const P = H * W;
       const input = new Float32Array(V * 3 * P);
       for (let v = 0; v < V; v++) {
         const px = views[v].rgba;
@@ -606,8 +606,9 @@
     // cloud sits upright in three.js (y up, z toward the viewer).
     // Points with non-finite coordinates are dropped and counted, because a
     // single NaN makes a whole view invisible.
-    function buildCloud(views, out, RES, P) {
+    function buildCloud(views, out, H, W) {
       const V = views.length;
+      const P = H * W;
       const depth = out.depth;
       const conf = out.depth_conf;
       const ext = out.extrinsics;
@@ -626,12 +627,11 @@
         const r10 = ext[e + 4], r11 = ext[e + 5], r12 = ext[e + 6], t1 = ext[e + 7];
         const r20 = ext[e + 8], r21 = ext[e + 9], r22 = ext[e + 10], t2 = ext[e + 11];
         const fx = K[k], fy = K[k + 4], cx = K[k + 2], cy = K[k + 5];
-        const { rgba, inside } = views[v];
+        const { rgba } = views[v];
 
-        for (let y = 0; y < RES; y++) {
-          for (let x = 0; x < RES; x++) {
-            const i = y * RES + x;
-            if (!inside[i]) continue;
+        for (let y = 0; y < H; y++) {
+          for (let x = 0; x < W; x++) {
+            const i = y * W + x;
             const g = v * P + i;
             const d = depth[g];
             if (!(d > 0) || !Number.isFinite(d)) continue;
@@ -791,18 +791,17 @@
       const pref = backendSel.value;
       const plan = planRun(pendingSources.length);
       const V = plan.V;
-      const RES = plan.res;
-      const P = RES * RES;
       const sources = V < pendingSources.length ? sampleEvenly(pendingSources, V) : pendingSources;
-      if (V < pendingSources.length || RES !== RES_ORDER[0]) {
-        log("warn", "reduced input to fit memory", { picked: pendingSources.length, V, res: RES, peakEstMB: plan.peakMB, budgetMB: MEM_BUDGET_MB });
-        setStatus(`Using ${V} of ${pendingSources.length} photos at ${RES} px to stay within the memory limit.`);
+      const { W, H } = inputSize(sources[0], plan.longSide);
+      if (V < pendingSources.length) {
+        log("warn", "too many photos for the memory budget, using a subset", { picked: pendingSources.length, V, budgetMB: MEM_BUDGET_MB });
+        setStatus(`Using ${V} of ${pendingSources.length} photos to stay within the memory limit.`);
       }
       const runNo = ++runCounter;
       const timings = {};
       const tRun = performance.now();
       // Written before any heavy work, so a crash leaves this line behind.
-      log("info", `run ${runNo} start`, { V, pref, res: RES, peakEstMB: plan.peakMB, jsHeap: memSnap() });
+      log("info", `run ${runNo} start`, { V, pref, W, H, peakEstMB: plan.peakMB, jsHeap: memSnap() });
 
       setBusy(true);
       try {
@@ -810,12 +809,12 @@
         showWorking("Preparing…");
 
         let t = performance.now();
-        const views = sources.map((src) => toView(src, RES));
-        const input = buildInput(views, RES, P);
+        const views = sources.map((src) => toView(src, W, H));
+        const input = buildInput(views, H, W);
         timings.inputBuildMs = round(performance.now() - t);
 
         showWorking("Loading model…");
-        const reply = await callWorker({ type: "run", input, V, res: RES, prefer: pref }, [input.buffer], (m) => {
+        const reply = await callWorker({ type: "run", input, V, H, W, prefer: pref }, [input.buffer], (m) => {
           if (m.phase === "infer") setPhase(`Running the model on ${V} view${V > 1 ? "s" : ""}…`);
           else if (m.total !== undefined) setPhase(`Loading model… ${mb(m.done)}${m.total ? " / " + mb(m.total) : ""} MB.`);
         });
@@ -826,7 +825,7 @@
         hideWorking();
         setStatus("Model finished. Building point cloud…");
         t = performance.now();
-        cloud = buildCloud(views, reply.result, RES, P);
+        cloud = buildCloud(views, reply.result, H, W);
         timings.buildCloudMs = round(performance.now() - t);
         if (cloud.dropped) log("warn", `run ${runNo}: dropped non-finite points`, { dropped: cloud.dropped });
 

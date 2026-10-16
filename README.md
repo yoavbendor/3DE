@@ -9,7 +9,7 @@ Live page: `https://<your-user>.github.io/3DE/` once GitHub Pages is enabled (se
 | Path | What it is |
 | --- | --- |
 | `index.html` | The whole app: capture, inference, point cloud, viewer, PLY export. |
-| `model/da3-small-fp16.onnx` | DA3-SMALL exported to ONNX, float16 weights (56 MB). Served by Pages. |
+| `model/da3-small-dyn-fp16.onnx` | DA3-SMALL exported to ONNX with dynamic views, height and width; float16 weights, float32 compute (55 MB). Served by Pages. |
 | `tools/export_onnx.py` | Reproduces the ONNX export from the official PyTorch weights. |
 | `tools/requirements.txt` | Python deps for the export. |
 
@@ -47,20 +47,22 @@ python tools/export_onnx.py \
   --da3-src /tmp/da3/src \
   --config  /tmp/da3/src/depth_anything_3/configs/da3-small.yaml \
   --weights /tmp/da3-weights/model.safetensors \
-  --res 504 --fp16
-mv build/da3-small-fp16.onnx model/
+  --fp16
+mv build/da3-small-fp16.onnx model/da3-small-dyn-fp16.onnx
 ```
 
-The script patches three spots in the upstream model so `torch.onnx` can trace it. None of them change the maths at the fixed 504 input: the RoPE table size is a constant instead of `int(positions.max())`, and one sin/cos table is kept in float32. It checks the exported graph against PyTorch before it writes the fp16 copy.
+The export makes the number of views, the height and the width dynamic, so one file serves every input size. To trace that, the script patches a few upstream spots without changing the maths: a fixed-size RoPE table, position grids and the DINOv2 position-embedding resize computed from the symbolic size, the DPT heads' output size kept symbolic, and one sin/cos table in float32. It checks the exported graph against PyTorch at three different shapes before writing the copy with float16 weights.
 
-The page picks the input size per run: `planRun()` in `index.html` keeps as many photos as the memory budget allows, then uses the largest size that fits. Sizes are 504, 252 and 224 px (multiples of 14), each with its own model file in `model/`. Two or more photos never use more than 252 px (`MULTI_VIEW_MAX_RES`). Peak memory per size and view count is in `PEAK_MB`. If you export a new size, add its model to `MODELS` in `worker.js` and its numbers to `PEAK_MB`.
+It loads the Hugging Face weights directly (as the official `from_pretrained` does), not through `convert_general_state_dict`, which is meant for raw training checkpoints and drops the trained camera token.
+
+The page feeds each photo at its own aspect ratio (longest side rounded to a multiple of 14, as upstream does) and picks the longest side per run: `planRun()` in `index.html` keeps as many photos as the memory budget allows (up to 6), then uses the largest size that fits. Peak memory per size and view count is in `PEAK_MB`.
 
 ## Known limits
 
 - **Speed on phones is not measured yet.** On a headless Linux CPU, 4 views took about 47 s on the WASM backend. An iPhone 15 with WebGPU should be much faster, but that needs a real test.
-- **Memory.** 8 views at 504² is the default cap. If Safari reloads the tab, lower `MAX_VIEWS` in `index.html`.
+- **Memory.** The budget is 820 MB (`MEM_BUDGET_MB`); one photo runs at 504 px, six at 252 px. If Safari reloads the tab, lower the budget.
 - **Single-threaded WASM.** GitHub Pages cannot send the cross-origin isolation headers, so threads are off.
-- **Pose quality.** The export keeps the checkpoint's trained `camera_token`. The upstream loader drops it, which made multi-view poses random from run to run; keeping it gives a stable reference view. Check reconstructions on new captures before trusting them.
+- **Multi-view accuracy.** DA3-SMALL's depth maps for different views disagree by a few percent of the scene size (DA3-LARGE about 2%, measured on the same photos), so overlapping views show as slightly offset layers rather than one surface. This is the model, not the page: the official code gives the same numbers.
 - **Object-only captures.** Background and table surfaces show up as points. Use the confidence slider, or shoot against a plain background.
 
 ## Licences
