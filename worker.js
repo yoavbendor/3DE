@@ -1,6 +1,6 @@
 // Runs the ONNX model off the main thread so the page stays responsive.
 // In:  {id, type:'load', prefer} | {id, type:'run', input, V, prefer}
-//      res: 504 | 336 (picks the model file), prefer: "auto" (WebGPU, then CPU) | "webgpu" | "cpu"
+//      res: 504 | 252 | 224 (picks the model file), prefer: "auto" (WebGPU, then CPU) | "webgpu" | "cpu"
 // Out: {type:'log', level, msg, data}                      (diagnostics, any time)
 //      {id, type:'progress', done, total} | {id, type:'progress', phase:'infer'}
 //      {id, type:'done', backend, result?, stats?, timings?}
@@ -12,12 +12,12 @@ importScripts("https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.min.
 ort.env.wasm.numThreads = 1;
 ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/";
 
-const WORKER_BUILD = "debug-8";
-// Model file per input size. Two models so phones can run 3+ views at 336.
+const WORKER_BUILD = "debug-9";
+// Model file per input size. The page picks the size per run (planRun in index.html).
 const MODELS = {
   504: "model/da3-small-fp16.onnx",
-  336: "model/da3-small-336-fp16.onnx",
   252: "model/da3-small-252-fp16.onnx",
+  224: "model/da3-small-224-fp16.onnx",
 };
 const OUTPUTS = ["depth", "depth_conf", "extrinsics", "intrinsics"];
 
