@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>Object to 3D · Depth Anything 3 in the browser</title>
   <link rel="icon" href="data:,">
+  <title>Object to 3D · Depth Anything 3 in the browser</title>
   <meta name="description" content="Capture a few photos or a short video of an object and get a 3D point cloud, computed on your device with Depth Anything 3 (small).">
   <style>
     :root {
@@ -33,7 +33,7 @@
       padding: 14px;
       margin-bottom: 14px;
     }
-    button, .button {
+    button, .button, select {
       font: inherit;
       color: var(--fg);
       background: #232630;
@@ -43,7 +43,7 @@
       cursor: pointer;
     }
     button.primary, .button.primary { background: var(--accent); color: #0b1020; border-color: transparent; font-weight: 600; }
-    button:disabled, .button.disabled { opacity: .45; cursor: default; }
+    button:disabled, select:disabled, .button.disabled { opacity: .45; cursor: default; }
     input[type="file"] { display: none; }
     .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
     .status { color: var(--muted); font-size: .92rem; min-height: 1.4em; margin: 10px 0 0; display: flex; align-items: center; gap: 8px; }
@@ -54,7 +54,6 @@
       border-radius: 50%;
       animation: spin .8s linear infinite;
     }
-    .spinner[hidden] { display: none; }
     @keyframes spin { to { transform: rotate(360deg); } }
     @media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 2.4s; } }
     .thumbs { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
@@ -66,15 +65,28 @@
       height: min(70vh, 620px);
       min-height: 320px;
       border-radius: 12px;
-      background: #000;
+      background: #0e0f12;
       touch-action: none;
     }
-    .placeholder { color: var(--muted); text-align: center; padding: 40px 0 0; }
     .controls { display: grid; grid-template-columns: 1fr; gap: 10px; margin-top: 10px; }
     @media (min-width: 620px) { .controls { grid-template-columns: 1fr 1fr; } }
     label { display: flex; flex-direction: column; gap: 4px; font-size: .9rem; color: var(--muted); }
     label span b { color: var(--fg); font-weight: 600; }
     input[type="range"] { width: 100%; accent-color: var(--accent); }
+    .muted { color: var(--muted); font-size: .9rem; }
+    details { margin-top: 10px; }
+    summary { cursor: pointer; color: var(--muted); }
+    textarea#debugText {
+      width: 100%;
+      height: 260px;
+      margin-top: 8px;
+      background: #0b0c0f;
+      color: #cfd2d8;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      font: 12px/1.4 ui-monospace, Menlo, Consolas, monospace;
+      padding: 8px;
+    }
     .foot { color: var(--muted); font-size: .85rem; margin: 18px 0 32px; }
     code { background: #22242b; padding: 1px 5px; border-radius: 5px; }
   </style>
@@ -92,10 +104,19 @@
       <input type="file" id="files" accept="image/*,video/*" multiple>
       <button class="primary" id="generate" disabled>Generate 3D</button>
     </div>
+    <div class="row" style="margin-top:10px">
+      <label class="muted" for="backendSel" style="flex-direction:row;align-items:center;gap:8px">Run on
+        <select id="backendSel">
+          <option value="auto">Auto (WebGPU, then CPU)</option>
+          <option value="webgpu">WebGPU only</option>
+          <option value="cpu">CPU only (slower, most compatible)</option>
+        </select>
+      </label>
+    </div>
     <div class="status" id="status">Pick 4 to 8 photos from different angles, or one short video that walks around the object. One photo also works, but it only gives the visible side.</div>
     <div class="status" id="working" hidden><span class="spinner"></span><span id="workingText"></span></div>
     <div class="thumbs" id="thumbs"></div>
-    <div class="status" id="backend"></div>
+    <div class="muted" id="backend" style="margin-top:8px"></div>
   </div>
 
   <div class="panel">
@@ -114,6 +135,17 @@
     </div>
   </div>
 
+  <div class="panel">
+    <div class="row">
+      <button id="copyDebug">Copy debug info</button>
+      <span class="muted" id="copyState">Use this after a crash or a bad result, and paste the text to the developer.</span>
+    </div>
+    <details id="debugDetails">
+      <summary>Show debug info</summary>
+      <textarea id="debugText" readonly></textarea>
+    </details>
+  </div>
+
   <p class="foot">
     Runs fully on this device. The model file (<code>model/da3-small-fp16.onnx</code>) is downloaded once (about 56 MB) and cached by the browser.
     Each photo is letterboxed to 504×504 so its proportions are kept. The cloud uses the model's own camera poses to place each view in one space.
@@ -124,19 +156,23 @@
     import * as THREE from "three";
     import { OrbitControls } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js";
 
+    // ---------- constants ----------
+    const BUILD = "debug-2";
     // Must match --res passed to tools/export_onnx.py
     const RES = 504;
     const P = RES * RES;
-    const MODEL_URL = "model/da3-small-fp16.onnx";
     const MAX_VIEWS = 8;
     const MAX_POINTS = 600000;
     const PAD_GREY = "#808080";
     const MEAN = [0.485, 0.456, 0.406];
     const STD = [0.229, 0.224, 0.225];
+    const LOG_KEY = "da3-debug-current";
+    const PREV_KEY = "da3-debug-previous";
 
     const $ = (id) => document.getElementById(id);
     const fileEl = $("files");
     const generateBtn = $("generate");
+    const backendSel = $("backendSel");
     const statusEl = $("status");
     const workingEl = $("working");
     const workingText = $("workingText");
@@ -146,12 +182,160 @@
     const sizeEl = $("size");
     const downloadBtn = $("download");
     const resetBtn = $("reset");
+    const copyBtn = $("copyDebug");
+    const copyState = $("copyState");
+    const debugDetails = $("debugDetails");
+    const debugText = $("debugText");
 
     let cloud = null;        // raw per-pixel data from the last run
     let shown = null;        // what is currently on screen, used for export
     let radius = 1;
     let pendingViews = null; // letterboxed views waiting for the Generate button
     let busy = false;
+    let runCounter = 0;
+
+    // ---------- debug log (survives a tab crash: written to localStorage on every event) ----------
+    const SESSION = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-") + "-" + Math.random().toString(36).slice(2, 6);
+    const T0 = performance.now();
+    const entries = [];
+    let envInfo = null;
+
+    // Keep the previous session's log before this session starts writing.
+    try {
+      const old = localStorage.getItem(LOG_KEY);
+      if (old) localStorage.setItem(PREV_KEY, old);
+    } catch { /* storage can be blocked: the log then only lives in memory */ }
+
+    function persist() {
+      const payload = (n) => JSON.stringify({ session: SESSION, build: BUILD, entries: entries.slice(-n) });
+      try {
+        localStorage.setItem(LOG_KEY, payload(400));
+      } catch {
+        try { localStorage.setItem(LOG_KEY, payload(100)); } catch { /* give up quietly */ }
+      }
+    }
+
+    function log(level, msg, data, src = "page") {
+      const e = { t: Math.round(performance.now() - T0), level, src, msg };
+      if (data !== undefined) e.data = data;
+      entries.push(e);
+      if (entries.length > 800) entries.splice(0, entries.length - 800);
+      persist();
+      const line = `[da3] ${msg}`;
+      if (level === "error") console.error(line, data ?? "");
+      else console.log(line, data ?? "");
+    }
+
+    const round = (x) => Math.round(x);
+    function memSnap() {
+      const m = performance.memory;
+      if (!m) return "not exposed by this browser";
+      return { usedMB: round(m.usedJSHeapSize / 1e6), limitMB: round(m.jsHeapSizeLimit / 1e6) };
+    }
+
+    async function collectEnv() {
+      let webgl = "unavailable";
+      try {
+        const c = document.createElement("canvas");
+        const g = c.getContext("webgl2");
+        if (g) {
+          const d = g.getExtension("WEBGL_debug_renderer_info");
+          webgl = { renderer: d ? g.getParameter(d.UNMASKED_RENDERER_WEBGL) : "hidden", maxTexture: g.getParameter(g.MAX_TEXTURE_SIZE) };
+        }
+      } catch (err) { webgl = `error: ${err}`; }
+
+      let webgpu = "navigator.gpu missing";
+      try {
+        if (navigator.gpu) {
+          const a = await navigator.gpu.requestAdapter();
+          webgpu = a ? {
+            info: a.info ? { vendor: a.info.vendor, architecture: a.info.architecture, device: a.info.device, description: a.info.description } : "no info",
+            maxBufferMB: a.limits ? round(a.limits.maxBufferSize / 1e6) : "n/a",
+            maxStorageBufferMB: a.limits ? round(a.limits.maxStorageBufferBindingSize / 1e6) : "n/a",
+          } : "no adapter";
+        }
+      } catch (err) { webgpu = `error: ${err}`; }
+
+      return {
+        build: BUILD,
+        userAgent: navigator.userAgent,
+        platform: navigator.platform,
+        touchPoints: navigator.maxTouchPoints,
+        cores: navigator.hardwareConcurrency,
+        deviceMemoryGB: navigator.deviceMemory ?? "n/a",
+        devicePixelRatio: window.devicePixelRatio,
+        viewport: [window.innerWidth, window.innerHeight],
+        crossOriginIsolated: window.crossOriginIsolated,
+        webgl,
+        webgpu,
+        jsHeap: memSnap(),
+      };
+    }
+
+    // Describe the previous session: did it end during a run?
+    function analysePrevious() {
+      let prev = null;
+      try { prev = JSON.parse(localStorage.getItem(PREV_KEY) || "null"); } catch { prev = null; }
+      if (!prev || !prev.entries || !prev.entries.length) return { prev: null, text: "No earlier session was logged in this browser." };
+      const list = prev.entries;
+      const last = list[list.length - 1];
+      let openRun = null;
+      for (const e of list) {
+        const m = /^run (\d+) (start|end|failed)/.exec(e.msg);
+        if (!m) continue;
+        if (m[2] === "start") openRun = m[1];
+        else if (openRun === m[1]) openRun = null;
+      }
+      const lastText = `last event: "${last.msg}" at +${last.t} ms (${last.level})`;
+      if (openRun !== null) {
+        return { prev, text: `The earlier session (${prev.session}, build ${prev.build}) stopped during run ${openRun} and never finished. Typical cause on iPhone: the browser tab was killed for using too much memory. ${lastText}.` };
+      }
+      return { prev, text: `The earlier session (${prev.session}, build ${prev.build}) did not leave an unfinished run. ${lastText}.` };
+    }
+
+    // ---------- debug report (copy button) ----------
+    const fmt = (e) => `+${String(e.t).padStart(7)}ms [${e.level}] (${e.src}) ${e.msg}${e.data !== undefined ? " " + JSON.stringify(e.data) : ""}`;
+
+    function buildReport() {
+      const prevInfo = analysePrevious();
+      const lines = [];
+      lines.push(`DA3 debug report, build ${BUILD}, session ${SESSION}`);
+      lines.push(`Copied at ${new Date().toISOString()}`);
+      lines.push("");
+      lines.push("== Earlier session ==");
+      lines.push(prevInfo.text);
+      if (prevInfo.prev) {
+        for (const e of prevInfo.prev.entries.slice(-150)) lines.push(fmt(e));
+      }
+      lines.push("");
+      lines.push("== This session ==");
+      lines.push(`jsHeap now: ${JSON.stringify(memSnap())}`);
+      for (const e of entries) lines.push(fmt(e));
+      return lines.join("\n");
+    }
+
+    function refreshDebugText() {
+      debugText.value = buildReport();
+    }
+
+    debugDetails.addEventListener("toggle", () => { if (debugDetails.open) refreshDebugText(); });
+
+    copyBtn.addEventListener("click", async () => {
+      const text = buildReport();
+      debugText.value = text;
+      try {
+        await navigator.clipboard.writeText(text);
+        copyState.textContent = `Copied ${text.split("\n").length} lines.`;
+      } catch {
+        // Fallback: open the text box and select it so the user can copy it by hand.
+        debugDetails.open = true;
+        debugText.focus();
+        debugText.select();
+        try { document.execCommand("copy"); copyState.textContent = "Copied."; } catch {
+          copyState.textContent = "Copy was blocked. The text is selected under “Show debug info”: long-press it and choose Copy.";
+        }
+      }
+    });
 
     // ---------- three.js scene ----------
     const canvas = $("view");
@@ -200,9 +384,7 @@
       workingEl.hidden = false;
       timer = setInterval(render, 1000);
     }
-    function setPhase(label) {
-      phaseLabel = label;
-    }
+    function setPhase(label) { phaseLabel = label; }
     function hideWorking() {
       clearInterval(timer);
       timer = null;
@@ -212,32 +394,42 @@
     function setBusy(on) {
       busy = on;
       fileEl.disabled = on;
+      backendSel.disabled = on;
       $("chooseLabel").classList.toggle("disabled", on);
       generateBtn.disabled = on || !pendingViews;
       if (!on) hideWorking();
     }
 
     // ---------- worker (model runs off the main thread) ----------
-    const worker = new Worker("worker.js");
+    let worker = null;
     const pending = new Map();
     let nextId = 1;
 
-    worker.onmessage = (e) => {
-      const m = e.data;
-      const req = pending.get(m.id);
-      if (!req) return;
-      if (m.type === "progress") {
-        req.onProgress?.(m.done, m.total);
-        return;
-      }
-      pending.delete(m.id);
-      if (m.type === "error") req.reject(new Error(m.message));
-      else req.resolve(m);
-    };
-    worker.onerror = (e) => {
-      for (const req of pending.values()) req.reject(new Error(e.message || "worker failed"));
+    function failAll(err) {
+      for (const req of pending.values()) req.reject(err);
       pending.clear();
-    };
+    }
+
+    function createWorker() {
+      worker = new Worker("worker.js");
+      worker.onmessage = (e) => {
+        const m = e.data;
+        if (m.type === "log") { log(m.level, m.msg, m.data, "worker"); return; }
+        const req = pending.get(m.id);
+        if (!req) return;
+        if (m.type === "progress") { req.onProgress?.(m); return; }
+        pending.delete(m.id);
+        if (m.type === "error") req.reject(new Error(m.message));
+        else req.resolve(m);
+      };
+      worker.onerror = (e) => {
+        log("error", "worker error", { message: e.message, file: e.filename, line: e.lineno });
+        failAll(new Error(`the model worker stopped (${e.message || "unknown error"})`));
+        worker.terminate();
+        createWorker();
+      };
+    }
+    createWorker();
 
     function callWorker(msg, transfer = [], onProgress = null) {
       const id = nextId++;
@@ -245,18 +437,6 @@
         pending.set(id, { resolve, reject, onProgress });
         worker.postMessage({ id, ...msg }, transfer);
       });
-    }
-
-    let loaded = null;
-    function ensureModel() {
-      if (!loaded) {
-        loaded = callWorker({ type: "load", url: MODEL_URL }, [], (done, total) => {
-          setPhase(`Loading model… ${mb(done)}${total ? " / " + mb(total) : ""} MB.`);
-        }).then((m) => {
-          backendEl.textContent = `Backend: ${m.backend === "webgpu" ? "WebGPU" : "WebAssembly (CPU)"}`;
-        }).catch((err) => { loaded = null; throw err; });
-      }
-      return loaded;
     }
 
     // ---------- input frames ----------
@@ -300,6 +480,7 @@
     async function collectSources(files) {
       const sources = [];
       for (const f of files) {
+        log("info", "file selected", { name: f.name, type: f.type, sizeKB: round(f.size / 1024) });
         if (f.type.startsWith("video/")) {
           sources.push(...(await framesFromVideo(f, MAX_VIEWS)));
         } else if (f.type.startsWith("image/")) {
@@ -326,11 +507,10 @@
 
       const inside = new Uint8Array(P);
       for (let y = oy; y < oy + dh; y++) inside.fill(1, y * RES + ox, y * RES + ox + dw);
-      return { thumb: cv, rgba: ctx.getImageData(0, 0, RES, RES).data, inside };
+      return { thumb: cv, rgba: ctx.getImageData(0, 0, RES, RES).data, inside, src: `${w}x${h}` };
     }
 
-    // ---------- inference ----------
-    async function runModel(views, onReady) {
+    function buildInput(views) {
       const V = views.length;
       const input = new Float32Array(V * 3 * P);
       for (let v = 0; v < V; v++) {
@@ -341,10 +521,7 @@
           }
         }
       }
-      await ensureModel();
-      onReady?.();
-      const reply = await callWorker({ type: "run", input, V }, [input.buffer]);
-      return reply.result;
+      return input;
     }
 
     // ---------- point cloud ----------
@@ -352,6 +529,8 @@
     // Extrinsics are world-to-camera, so world = R^T (X_cam - t).
     // The output is in OpenCV axes (y down, z forward). Flip y and z so the
     // cloud sits upright in three.js (y up, z toward the viewer).
+    // Points with non-finite coordinates are dropped and counted, because a
+    // single NaN makes a whole view invisible.
     function buildCloud(views, out) {
       const V = views.length;
       const depth = out.depth;
@@ -364,6 +543,7 @@
       const cf = new Float32Array(N);
       const valid = new Uint8Array(N);
       const sample = [];
+      let dropped = 0;
 
       for (let v = 0; v < V; v++) {
         const e = v * 12, k = v * 9;
@@ -387,6 +567,7 @@
             const wx = r00 * ax + r10 * ay + r20 * az;
             const wy = r01 * ax + r11 * ay + r21 * az;
             const wz = r02 * ax + r12 * ay + r22 * az;
+            if (!Number.isFinite(wx) || !Number.isFinite(wy) || !Number.isFinite(wz)) { dropped++; continue; }
 
             pos[g * 3] = wx;
             pos[g * 3 + 1] = -wy;
@@ -401,7 +582,7 @@
         }
       }
       sample.sort((a, b) => a - b);
-      return { pos, col, cf, valid, N, sortedConf: sample };
+      return { pos, col, cf, valid, N, sortedConf: sample, dropped };
     }
 
     function applyFilter(fitView) {
@@ -446,6 +627,10 @@
       }
       dists.sort((a, b) => a - b);
       radius = dists.length ? Math.max(dists[Math.floor(dists.length * 0.9)], 1e-6) : 1;
+      if (!Number.isFinite(radius) || !Number.isFinite(centre.x)) {
+        log("error", "geometry is not finite, showing nothing", { centre: [centre.x, centre.y, centre.z], radius });
+        radius = 1;
+      }
 
       points.position.copy(centre).negate();
       updateSize();
@@ -460,6 +645,7 @@
       $("keepVal").textContent = Math.round(keep * 100);
       downloadBtn.disabled = outN === 0;
       resetBtn.disabled = false;
+      return { points: outN, radius: round(radius * 1000) / 1000, centre: [round(centre.x), round(centre.y), round(centre.z)] };
     }
 
     function updateSize() {
@@ -508,14 +694,16 @@
       if (!files.length || busy) return;
       try {
         setStatus("Reading photos or video…");
+        const t = performance.now();
         const sources = await collectSources(files);
         if (!sources.length) throw new Error("No images or video frames found in that selection");
         pendingViews = sources.map(toView);
+        log("info", "frames prepared", { views: pendingViews.length, sources: pendingViews.map((v) => v.src), ms: round(performance.now() - t) });
         thumbsEl.replaceChildren(...pendingViews.map((v) => v.thumb));
         generateBtn.disabled = false;
         setStatus(`${pendingViews.length} frame${pendingViews.length > 1 ? "s" : ""} ready. Check the thumbnails, then press Generate 3D.`);
       } catch (err) {
-        console.error(err);
+        log("error", "reading selection failed", { error: String(err && err.message || err) });
         pendingViews = null;
         generateBtn.disabled = true;
         setStatus(`Could not read that selection: ${err.message}`, true);
@@ -526,26 +714,65 @@
     generateBtn.addEventListener("click", async () => {
       if (!pendingViews || busy) return;
       const views = pendingViews;
+      const V = views.length;
+      const pref = backendSel.value;
+      const runNo = ++runCounter;
+      const timings = {};
+      const tRun = performance.now();
+      // Written before any heavy work, so a crash leaves this line behind.
+      log("info", `run ${runNo} start`, { V, pref, res: RES, jsHeap: memSnap() });
+
       setBusy(true);
       try {
-        const V = views.length;
-        const label = `Generating 3D from ${V} view${V > 1 ? "s" : ""}…`;
         setStatus("Working. This can take a minute on a phone. Keep this tab open.");
-        showWorking(`Loading model…`);
-        const out = await runModel(views, () => setPhase(label));
+        showWorking("Preparing…");
+
+        let t = performance.now();
+        const input = buildInput(views);
+        timings.inputBuildMs = round(performance.now() - t);
+
+        showWorking("Loading model…");
+        const reply = await callWorker({ type: "run", input, V, prefer: pref }, [input.buffer], (m) => {
+          if (m.phase === "infer") setPhase(`Running the model on ${V} view${V > 1 ? "s" : ""}…`);
+          else if (m.total !== undefined) setPhase(`Loading model… ${mb(m.done)}${m.total ? " / " + mb(m.total) : ""} MB.`);
+        });
+        Object.assign(timings, reply.timings);
+        log("info", `run ${runNo} model returned`, { backend: reply.backend, timings, stats: reply.stats });
+        backendEl.textContent = `Backend used: ${reply.backend === "webgpu" ? "WebGPU" : "WebAssembly (CPU)"}${reply.timings.fallback ? " (fell back from WebGPU: " + reply.timings.fallback + ")" : ""}`;
 
         hideWorking();
         setStatus("Model finished. Building point cloud…");
-        cloud = buildCloud(views, out);
-        applyFilter(true);
+        t = performance.now();
+        cloud = buildCloud(views, reply.result);
+        timings.buildCloudMs = round(performance.now() - t);
+        if (cloud.dropped) log("warn", `run ${runNo}: dropped non-finite points`, { dropped: cloud.dropped });
+
+        t = performance.now();
+        const geo = applyFilter(true);
+        timings.applyFilterMs = round(performance.now() - t);
+        timings.totalMs = round(performance.now() - tRun);
+        log("info", `run ${runNo} end`, { ok: true, geometry: geo, timings, jsHeap: memSnap() });
+
         setStatus(`Done: ${shown.n.toLocaleString()} points from ${V} view${V > 1 ? "s" : ""}. Drag to rotate, pinch to zoom.`);
       } catch (err) {
-        console.error(err);
-        setStatus(`Something went wrong: ${err.message}`, true);
+        log("error", `run ${runNo} failed`, { error: String(err && err.message || err), timings });
+        setStatus(`Something went wrong: ${err.message}. Press “Copy debug info” and send it.`, true);
       } finally {
         setBusy(false);
       }
     });
+
+    // Log the environment once, and warn about a crashed earlier session.
+    const prevNote = analysePrevious();
+    collectEnv().then((env) => {
+      envInfo = env;
+      log("info", "environment", env);
+    });
+    log("info", "page loaded", { session: SESSION, previousSession: prevNote.text });
+    window.addEventListener("error", (e) => log("error", "uncaught error", { message: e.message, file: e.filename, line: e.lineno }));
+    window.addEventListener("unhandledrejection", (e) => log("error", "unhandled promise rejection", { reason: String(e.reason && e.reason.message || e.reason) }));
+    document.addEventListener("visibilitychange", () => log("info", `visibility ${document.visibilityState}`));
+    window.addEventListener("pagehide", () => log("info", "pagehide"));
 
     keepEl.addEventListener("input", () => applyFilter(false));
     sizeEl.addEventListener("input", updateSize);

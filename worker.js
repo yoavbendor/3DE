@@ -1,6 +1,10 @@
 // Runs the ONNX model off the main thread so the page stays responsive.
-// Messages in:  {id, type:'load', url} | {id, type:'run', input, V}
-// Messages out: {id, type:'progress', done, total} | {id, type:'done', ...} | {id, type:'error', message}
+// In:  {id, type:'load', prefer} | {id, type:'run', input, V, prefer}
+//      prefer: "auto" (WebGPU, then CPU) | "webgpu" | "cpu"
+// Out: {type:'log', level, msg, data}                      (diagnostics, any time)
+//      {id, type:'progress', done, total} | {id, type:'progress', phase:'infer'}
+//      {id, type:'done', backend, result?, stats?, timings?}
+//      {id, type:'error', message}
 
 importScripts("https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.min.js");
 
@@ -9,19 +13,34 @@ ort.env.wasm.numThreads = 1;
 ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/";
 
 const RES = 504;
+const MODEL_URL = "model/da3-small-fp16.onnx";
+const OUTPUTS = ["depth", "depth_conf", "extrinsics", "intrinsics"];
+
+let modelBytes = null;
 let session = null;
-let loading = null;
+let sessionKind = null; // backend actually in use: "webgpu" | "wasm"
+let sessionPref = null; // what the page asked for
+
+const now = () => performance.now();
+const round = (x) => Math.round(x * 1000) / 1000;
+const log = (level, msg, data) => postMessage({ type: "log", level, msg, data });
 
 async function openCache() {
   try { return await caches.open("da3-model-v1"); } catch { return null; }
 }
 
-async function fetchModel(url, id) {
+async function getModelBytes(id) {
+  if (modelBytes) return modelBytes;
+  const t = now();
   const cache = await openCache();
-  const cached = cache && (await cache.match(url).catch(() => null));
-  if (cached) return new Uint8Array(await cached.arrayBuffer());
+  const cached = cache && (await cache.match(MODEL_URL).catch(() => null));
+  if (cached) {
+    modelBytes = new Uint8Array(await cached.arrayBuffer());
+    log("info", "model read from browser cache", { bytes: modelBytes.length, ms: round(now() - t) });
+    return modelBytes;
+  }
 
-  const resp = await fetch(url);
+  const resp = await fetch(MODEL_URL);
   if (!resp.ok) throw new Error(`Model download failed (HTTP ${resp.status})`);
   const total = Number(resp.headers.get("content-length")) || 0;
   const reader = resp.body.getReader();
@@ -37,49 +56,119 @@ async function fetchModel(url, id) {
   const bytes = new Uint8Array(received);
   let offset = 0;
   for (const c of chunks) { bytes.set(c, offset); offset += c.length; }
-  if (cache) cache.put(url, new Response(bytes.slice())).catch(() => {});
+  if (cache) cache.put(MODEL_URL, new Response(bytes.slice())).catch(() => {});
+  modelBytes = bytes;
+  log("info", "model downloaded", { bytes: received, ms: round(now() - t) });
   return bytes;
 }
 
-async function load(id, url) {
-  const bytes = await fetchModel(url, id);
-  const providers = "gpu" in navigator ? ["webgpu", "wasm"] : ["wasm"];
-  for (const ep of providers) {
+async function ensureSession(pref, id) {
+  if (session && sessionPref === pref) return;
+  const bytes = await getModelBytes(id);
+  if (session) {
+    try { await session.release(); } catch { /* ignore */ }
+    session = null;
+  }
+  const hasGpu = "gpu" in navigator;
+  const eps = pref === "cpu" ? ["wasm"]
+    : pref === "webgpu" ? ["webgpu"]
+    : hasGpu ? ["webgpu", "wasm"] : ["wasm"];
+  log("info", "creating session", { pref, navigatorGpu: hasGpu, tryOrder: eps });
+
+  for (const ep of eps) {
+    const t = now();
     try {
       session = await ort.InferenceSession.create(bytes, {
         executionProviders: [ep],
         graphOptimizationLevel: "all",
       });
-      return ep;
+      sessionKind = ep;
+      sessionPref = pref;
+      log("info", `session ready on ${ep}`, { ms: round(now() - t) });
+      return;
     } catch (err) {
-      console.warn(`${ep} backend unavailable`, err);
+      log("warn", `session failed on ${ep}`, { ms: round(now() - t), error: String((err && err.message) || err) });
     }
   }
-  throw new Error("Could not start the model on this device");
+  throw new Error("Could not start the model on this device (no WebGPU or WebAssembly backend worked)");
+}
+
+// Count NaN/Infinity and the finite range, so a broken output is visible in the log.
+function statsOf(a) {
+  let nonFinite = 0, min = Infinity, max = -Infinity;
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i];
+    if (!Number.isFinite(x)) { nonFinite++; continue; }
+    if (x < min) min = x;
+    if (x > max) max = x;
+  }
+  return { n: a.length, nonFinite, min: round(min), max: round(max) };
+}
+
+async function infer(input, V, id) {
+  const feeds = { images: new ort.Tensor("float32", input, [1, V, 3, RES, RES]) };
+  postMessage({ id, type: "progress", phase: "infer" });
+  const t = now();
+  const out = await session.run(feeds);
+  const ms = round(now() - t);
+  const result = {};
+  for (const k of OUTPUTS) result[k] = out[k].data.slice();
+  return { result, ms };
+}
+
+async function run(m) {
+  const timings = {};
+  let t = now();
+  await ensureSession(m.prefer, m.id);
+  timings.sessionMs = round(now() - t);
+
+  let fallback = null;
+  let attempt;
+  try {
+    attempt = await infer(m.input, m.V, m.id);
+  } catch (err) {
+    if (sessionKind !== "webgpu") throw err;
+    log("error", "WebGPU inference threw, retrying on CPU", { error: String((err && err.message) || err) });
+    fallback = "webgpu-error";
+    await ensureSession("cpu", m.id);
+    attempt = await infer(m.input, m.V, m.id);
+  }
+
+  let stats = {};
+  for (const k of OUTPUTS) stats[k] = statsOf(attempt.result[k]);
+  const broken = OUTPUTS.some((k) => stats[k].nonFinite > 0);
+  if (broken && sessionKind === "webgpu") {
+    log("warn", "WebGPU produced NaN/Infinity, retrying on CPU", stats);
+    fallback = "non-finite-output";
+    await ensureSession("cpu", m.id);
+    attempt = await infer(m.input, m.V, m.id);
+    stats = {};
+    for (const k of OUTPUTS) stats[k] = statsOf(attempt.result[k]);
+  }
+
+  timings.inferMs = attempt.ms;
+  timings.backend = sessionKind;
+  timings.fallback = fallback;
+  log("info", "inference finished", { backend: sessionKind, V: m.V, inferMs: attempt.ms, fallback, stats });
+  return { result: attempt.result, stats, timings };
 }
 
 self.onmessage = async (e) => {
   const m = e.data;
   try {
     if (m.type === "load") {
-      if (!loading) loading = load(m.id, m.url).catch((err) => { loading = null; throw err; });
-      const backend = await loading;
-      postMessage({ id: m.id, type: "done", backend });
+      await ensureSession(m.prefer, m.id);
+      postMessage({ id: m.id, type: "done", backend: sessionKind });
     } else if (m.type === "run") {
-      if (!loading) throw new Error("Model not loaded");
-      await loading;
-      const feeds = { images: new ort.Tensor("float32", m.input, [1, m.V, 3, RES, RES]) };
-      const out = await session.run(feeds);
-      const result = {
-        depth: out.depth.data,
-        depth_conf: out.depth_conf.data,
-        extrinsics: out.extrinsics.data,
-        intrinsics: out.intrinsics.data,
-      };
-      const transfer = Object.values(result).map((a) => a.buffer);
-      postMessage({ id: m.id, type: "done", result }, transfer);
+      const r = await run(m);
+      const transfer = OUTPUTS.map((k) => r.result[k].buffer);
+      postMessage({ id: m.id, type: "done", backend: sessionKind, ...r }, transfer);
     }
   } catch (err) {
-    postMessage({ id: m.id, type: "error", message: err.message || String(err) });
+    const message = String((err && err.message) || err);
+    log("error", "worker step failed", { type: m.type, message, stack: err && err.stack ? String(err.stack).slice(0, 800) : undefined });
+    postMessage({ id: m.id, type: "error", message });
   }
 };
+
+log("info", "worker started", { userAgent: navigator.userAgent });
