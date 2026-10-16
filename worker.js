@@ -12,7 +12,7 @@ importScripts("https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.min.
 ort.env.wasm.numThreads = 1;
 ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/";
 
-const WORKER_BUILD = "debug-9";
+const WORKER_BUILD = "debug-10";
 // Model file per input size. The page picks the size per run (planRun in index.html).
 const MODELS = {
   504: "model/da3-small-fp16.onnx",

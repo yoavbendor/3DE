@@ -98,7 +98,12 @@ def load_model(da3_src: str, config: str, weights: str):
     from depth_anything_3.utils.model_loading import convert_general_state_dict
 
     model = create_object(OmegaConf.load(config)).eval()
-    state = convert_general_state_dict(load_file(weights))
+    raw = load_file(weights)
+    state = convert_general_state_dict(dict(raw))
+    # The upstream loader drops the trained camera token, which leaves the
+    # multi-view path with a random token. Poses then change with every run
+    # (checked with several seeds on real photos), so keep the trained token.
+    state["backbone.pretrained.camera_token"] = raw["model.backbone.pretrained.camera_token"]
     # Same key handling as the upstream loader: strip the "model." prefix.
     state = {(k[len("model.") :] if k.startswith("model.") else k): v for k, v in state.items()}
     missing, unexpected = model.load_state_dict(state, strict=False)

@@ -60,7 +60,7 @@ The page picks the input size per run: `planRun()` in `index.html` keeps as many
 - **Speed on phones is not measured yet.** On a headless Linux CPU, 4 views took about 47 s on the WASM backend. An iPhone 15 with WebGPU should be much faster, but that needs a real test.
 - **Memory.** 8 views at 504² is the default cap. If Safari reloads the tab, lower `MAX_VIEWS` in `index.html`.
 - **Single-threaded WASM.** GitHub Pages cannot send the cross-origin isolation headers, so threads are off.
-- **Pose quality.** The checkpoint includes a `camera_token` for the multi-view path, but the upstream loader deletes it, so the model uses a randomly initialised token. This app loads the weights the same way upstream does. Check the reconstructions on real captures before relying on the poses.
+- **Pose quality.** The export keeps the checkpoint's trained `camera_token`. The upstream loader drops it, which made multi-view poses random from run to run; keeping it gives a stable reference view. Check reconstructions on new captures before trusting them.
 - **Object-only captures.** Background and table surfaces show up as points. Use the confidence slider, or shoot against a plain background.
 
 ## Licences
