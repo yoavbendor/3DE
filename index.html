@@ -158,17 +158,29 @@
     import { OrbitControls } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js";
 
     // ---------- constants ----------
-    const BUILD = "debug-7";
-    // Must match --res passed to tools/export_onnx.py. One view or two use the
-    // full 504 model; three or more use the 336 model, because attention memory
-    // grows with (views x tokens)^2 and phones run out of memory at 504.
-    const RES_FULL = 504;
-    const RES_MULTI = 336;
-    const resFor = (V) => (V >= 2 ? RES_MULTI : RES_FULL);
-    // Peak memory measured on the CPU backend: 1 view at 504 px ~820 MB (worked on
-    // iPhone), 3 views at 336 px ~870 MB, 5 views at 336 px ~1200 MB (killed on iPhone).
-    // WebGPU (Auto) also died at 5 views on iPhone, so every backend uses the same cap.
-    const MAX_RUN_VIEWS = 3;
+    const BUILD = "debug-8";
+    // Input sizes. Each must match a model exported with --res (multiple of 14).
+    const RES_ORDER = [504, 420, 336, 252];
+    // Peak memory per run in MB, measured with onnxruntime-web on the CPU backend.
+    // Phone reference points: 1 view at 504 px (~820 MB) worked; 5 views at 336 px
+    // (~1210 MB) was killed. Budget is set at the known-good point.
+    const PEAK_MB = {
+      504: { 1: 818, 2: 1090 },
+      420: { 1: 697, 2: 930 },
+      336: { 1: 640, 2: 732, 3: 870, 4: 1033, 5: 1209 },
+      252: { 1: 634, 2: 601, 3: 703, 4: 803, 5: 842 },
+    };
+    const MEM_BUDGET_MB = 820;
+    // Keep as many photos as possible, then use the largest size that fits the budget.
+    function planRun(N) {
+      for (let V = Math.min(N, 5); V >= 1; V--) {
+        for (const res of RES_ORDER) {
+          const peak = PEAK_MB[res][V];
+          if (peak !== undefined && peak <= MEM_BUDGET_MB) return { V, res, peakMB: peak };
+        }
+      }
+      return { V: 1, res: 252, peakMB: PEAK_MB[252][1] };
+    }
     const MAX_VIEWS = 8;
     const MAX_POINTS = 600000;
     const PAD_GREY = "#808080";
@@ -773,20 +785,20 @@
     generateBtn.addEventListener("click", async () => {
       if (!pendingSources || busy) return;
       const pref = backendSel.value;
-      const cap = MAX_RUN_VIEWS;
-      const sources = pendingSources.length > cap ? sampleEvenly(pendingSources, cap) : pendingSources;
-      if (sources.length < pendingSources.length) {
-        log("warn", "too many photos for this backend, using a subset", { picked: pendingSources.length, used: sources.length, pref });
-        setStatus(`Using ${sources.length} of ${pendingSources.length} photos to stay within this backend's memory limit.`);
-      }
-      const V = sources.length;
-      const RES = resFor(V);
+      const plan = planRun(pendingSources.length);
+      const V = plan.V;
+      const RES = plan.res;
       const P = RES * RES;
+      const sources = V < pendingSources.length ? sampleEvenly(pendingSources, V) : pendingSources;
+      if (V < pendingSources.length || RES !== RES_ORDER[0]) {
+        log("warn", "reduced input to fit memory", { picked: pendingSources.length, V, res: RES, peakEstMB: plan.peakMB, budgetMB: MEM_BUDGET_MB });
+        setStatus(`Using ${V} of ${pendingSources.length} photos at ${RES} px to stay within the memory limit.`);
+      }
       const runNo = ++runCounter;
       const timings = {};
       const tRun = performance.now();
       // Written before any heavy work, so a crash leaves this line behind.
-      log("info", `run ${runNo} start`, { V, pref, res: resFor(V), jsHeap: memSnap() });
+      log("info", `run ${runNo} start`, { V, pref, res: RES, peakEstMB: plan.peakMB, jsHeap: memSnap() });
 
       setBusy(true);
       try {

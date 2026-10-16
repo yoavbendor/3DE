@@ -53,7 +53,7 @@ mv build/da3-small-fp16.onnx model/
 
 The script patches three spots in the upstream model so `torch.onnx` can trace it. None of them change the maths at the fixed 504 input: the RoPE table size is a constant instead of `int(positions.max())`, and one sin/cos table is kept in float32. It checks the exported graph against PyTorch before it writes the fp16 copy.
 
-If you change `--res`, change `RES` in `index.html` too. It must be a multiple of 14.
+The page picks the input size per run: `planRun()` in `index.html` keeps as many photos as the memory budget allows, then uses the largest size that fits. Sizes are 504, 336 and 252 px (multiples of 14), each with its own model file in `model/`. Peak memory per size and view count is in `PEAK_MB`. If you export a new size, add its model to `MODELS` in `worker.js` and its numbers to `PEAK_MB`.
 
 ## Known limits
 
