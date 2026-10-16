@@ -62,7 +62,7 @@ The page feeds each photo at its own aspect ratio (longest side rounded to a mul
 - **Speed on phones is not measured yet.** On a headless Linux CPU, 4 views took about 47 s on the WASM backend. An iPhone 15 with WebGPU should be much faster, but that needs a real test.
 - **Memory.** The budget is 820 MB (`MEM_BUDGET_MB`); one photo runs at 504 px, six at 252 px. If Safari reloads the tab, lower the budget.
 - **Single-threaded WASM.** GitHub Pages cannot send the cross-origin isolation headers, so threads are off.
-- **Multi-view accuracy.** DA3-SMALL's depth maps for different views disagree by a few percent of the scene size (DA3-LARGE about 2%, measured on the same photos), so overlapping views show as slightly offset layers rather than one surface. This is the model, not the page: the official code gives the same numbers.
+- **Multi-view accuracy.** DA3-SMALL's depth maps for different views disagree by a few percent of the scene size (DA3-LARGE about 2%, measured on the same photos), so overlapping views show as slightly offset layers rather than one surface. This is the model, not the page: the official code gives the same numbers. The page compensates with a clean-up (on by default, checkbox under the viewer): it drops flying pixels at depth edges (`EDGE_REL`, 5% jump between neighbours) and drops a later view's points that land on a surface an earlier view already covers (`MERGE_TOL`, 15% depth tolerance), so each region is drawn once.
 - **Object-only captures.** Background and table surfaces show up as points. Use the confidence slider, or shoot against a plain background.
 
 ## Licences

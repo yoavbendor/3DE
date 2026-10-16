@@ -126,6 +126,9 @@
       <label for="keep">Points kept: <span><b id="keepVal">60</b>%</span>
         <input type="range" id="keep" min="5" max="100" value="60">
       </label>
+      <label class="muted" for="cleanup" style="flex-direction:row;align-items:center;gap:8px">
+        <input type="checkbox" id="cleanup" checked> Clean up edges and overlapping views
+      </label>
       <label for="size">Point size: <span><b id="sizeVal">4</b></span>
         <input type="range" id="size" min="1" max="12" value="4">
       </label>
@@ -158,7 +161,7 @@
     import { OrbitControls } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js";
 
     // ---------- constants ----------
-    const BUILD = "debug-12";
+    const BUILD = "debug-13";
     // Input size is the photo's longest side; the other side follows the photo's
     // own aspect ratio (no padding), both rounded to multiples of 14, as the
     // upstream preprocessing does. One model handles every size.
@@ -175,6 +178,12 @@
     };
     const MEM_BUDGET_MB = 820;
     const MAX_RUN_VIEWS = 6;
+    // Clean-up: drop "flying pixels" whose depth jumps by more than EDGE_REL
+    // against a neighbour, and drop a later view's points that land on a surface
+    // an earlier view already covers (depth within MERGE_TOL), so each region is
+    // drawn once. Tuned on real phone photos: DA3-SMALL views disagree by a few %.
+    const EDGE_REL = 0.05;
+    const MERGE_TOL = 0.15;
     // Keep as many photos as possible, then use the largest size that fits the budget.
     function planRun(N) {
       for (let V = Math.min(N, MAX_RUN_VIEWS); V >= 1; V--) {
@@ -202,6 +211,7 @@
     const backendEl = $("backend");
     const thumbsEl = $("thumbs");
     const keepEl = $("keep");
+    const cleanupEl = $("cleanup");
     const sizeEl = $("size");
     const downloadBtn = $("download");
     const resetBtn = $("reset");
@@ -212,6 +222,7 @@
     const debugText = $("debugText");
 
     let cloud = null;        // raw per-pixel data from the last run
+    let lastRun = null;      // model output of the last run, to rebuild the cloud
     let shown = null;        // what is currently on screen, used for export
     let radius = 1;
     let pendingSources = null; // picked photos/frames waiting for the Generate button
@@ -606,7 +617,7 @@
     // cloud sits upright in three.js (y up, z toward the viewer).
     // Points with non-finite coordinates are dropped and counted, because a
     // single NaN makes a whole view invisible.
-    function buildCloud(views, out, H, W) {
+    function buildCloud(views, out, H, W, cleanup) {
       const V = views.length;
       const P = H * W;
       const depth = out.depth;
@@ -619,7 +630,7 @@
       const cf = new Float32Array(N);
       const valid = new Uint8Array(N);
       const sample = [];
-      let dropped = 0;
+      let dropped = 0, edgeDropped = 0, mergedDropped = 0;
 
       for (let v = 0; v < V; v++) {
         const e = v * 12, k = v * 9;
@@ -635,6 +646,14 @@
             const g = v * P + i;
             const d = depth[g];
             if (!(d > 0) || !Number.isFinite(d)) continue;
+            if (cleanup) {
+              const lim = EDGE_REL * d;
+              if ((x > 0 && Math.abs(depth[g - 1] - d) > lim) || (x < W - 1 && Math.abs(depth[g + 1] - d) > lim) ||
+                  (y > 0 && Math.abs(depth[g - W] - d) > lim) || (y < H - 1 && Math.abs(depth[g + W] - d) > lim)) {
+                edgeDropped++;
+                continue;
+              }
+            }
 
             const ax = ((x - cx) / fx) * d - t0;
             const ay = ((y - cy) / fy) * d - t1;
@@ -656,8 +675,36 @@
           }
         }
       }
+      // Merge overlapping views: a point of view v that projects into an earlier
+      // view u onto a kept pixel at nearly the same depth is already drawn by u.
+      if (cleanup && V > 1) {
+        const cover = valid.slice();
+        for (let v = 1; v < V; v++) {
+          for (let i = 0; i < P; i++) {
+            const g = v * P + i;
+            if (!valid[g]) continue;
+            const wx = pos[g * 3], wy = -pos[g * 3 + 1], wz = -pos[g * 3 + 2];
+            for (let u = 0; u < v; u++) {
+              const e = u * 12, k = u * 9;
+              const zc = ext[e + 8] * wx + ext[e + 9] * wy + ext[e + 10] * wz + ext[e + 11];
+              if (!(zc > 1e-6)) continue;
+              const xc = ext[e] * wx + ext[e + 1] * wy + ext[e + 2] * wz + ext[e + 3];
+              const yc = ext[e + 4] * wx + ext[e + 5] * wy + ext[e + 6] * wz + ext[e + 7];
+              const px = Math.round((K[k] * xc) / zc + K[k + 2]);
+              const py = Math.round((K[k + 4] * yc) / zc + K[k + 5]);
+              if (px < 0 || px >= W || py < 0 || py >= H) continue;
+              const gu = u * P + py * W + px;
+              if (cover[gu] && Math.abs(zc - depth[gu]) <= MERGE_TOL * depth[gu]) {
+                valid[g] = 0;
+                mergedDropped++;
+                break;
+              }
+            }
+          }
+        }
+      }
       sample.sort((a, b) => a - b);
-      return { pos, col, cf, valid, N, sortedConf: sample, dropped };
+      return { pos, col, cf, valid, N, sortedConf: sample, dropped, edgeDropped, mergedDropped };
     }
 
     function applyFilter(fitView) {
@@ -825,7 +872,9 @@
         hideWorking();
         setStatus("Model finished. Building point cloud…");
         t = performance.now();
-        cloud = buildCloud(views, reply.result, H, W);
+        lastRun = { views, out: reply.result, H, W };
+        cloud = buildCloud(views, reply.result, H, W, cleanupEl.checked);
+        log("info", `run ${runNo} cleanup`, { on: cleanupEl.checked, edgeDropped: cloud.edgeDropped, mergedDropped: cloud.mergedDropped });
         timings.buildCloudMs = round(performance.now() - t);
         if (cloud.dropped) log("warn", `run ${runNo}: dropped non-finite points`, { dropped: cloud.dropped });
 
@@ -857,6 +906,13 @@
     window.addEventListener("pagehide", () => log("info", "pagehide"));
 
     keepEl.addEventListener("input", () => applyFilter(false));
+    cleanupEl.addEventListener("change", () => {
+      if (!lastRun) return;
+      cloud = buildCloud(lastRun.views, lastRun.out, lastRun.H, lastRun.W, cleanupEl.checked);
+      applyFilter(false);
+      log("info", "cleanup toggled", { on: cleanupEl.checked, edgeDropped: cloud.edgeDropped, mergedDropped: cloud.mergedDropped });
+      setStatus(`${shown.n.toLocaleString()} points${cleanupEl.checked ? ` (removed ${cloud.edgeDropped.toLocaleString()} edge and ${cloud.mergedDropped.toLocaleString()} overlapping)` : ""}.`);
+    });
     sizeEl.addEventListener("input", updateSize);
     downloadBtn.addEventListener("click", downloadPly);
     resetBtn.addEventListener("click", () => applyFilter(true));
