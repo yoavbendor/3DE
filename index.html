@@ -158,17 +158,18 @@
     import { OrbitControls } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js";
 
     // ---------- constants ----------
-    const BUILD = "debug-10";
+    const BUILD = "debug-11";
     // Input sizes. Each must match a model exported with --res (multiple of 14).
-    const RES_ORDER = [504, 252, 224];
-    // Two or more photos never go above this size: 252 px keeps two to four
-    // photos near the known-good memory level, and 224 px fits five.
-    const MULTI_VIEW_MAX_RES = 252;
+    const RES_ORDER = [504, 336, 252, 224];
+    // Two or more photos never go above this size: 336 px fits two photos under the
+    // budget, and 252 and 224 px cover three to five.
+    const MULTI_VIEW_MAX_RES = 336;
     // Peak memory per run in MB, measured with onnxruntime-web on the CPU backend.
     // Phone reference points: 1 view at 504 px (~820 MB) worked; 5 views at 336 px
     // (~1210 MB) was killed. Budget is set at the known-good point.
     const PEAK_MB = {
       504: { 1: 818, 2: 1090 },
+      336: { 1: 640, 2: 732 },
       252: { 1: 634, 2: 601, 3: 703, 4: 803, 5: 842 },
       224: { 1: 608, 2: 610, 3: 658, 4: 737, 5: 720 },
     };
