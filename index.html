@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Object to 3D · Depth Anything 3 in the browser</title>
+  <link rel="icon" href="data:,">
   <meta name="description" content="Capture a few photos or a short video of an object and get a 3D point cloud, computed on your device with Depth Anything 3 (small).">
   <style>
     :root {
@@ -15,6 +16,7 @@
       --border: #2a2c33;
     }
     * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
     html, body { margin: 0; background: var(--bg); color: var(--fg); }
     body {
       font: 16px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
@@ -41,13 +43,23 @@
       cursor: pointer;
     }
     button.primary, .button.primary { background: var(--accent); color: #0b1020; border-color: transparent; font-weight: 600; }
-    button:disabled { opacity: .5; cursor: default; }
+    button:disabled, .button.disabled { opacity: .45; cursor: default; }
     input[type="file"] { display: none; }
     .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
-    .status { color: var(--muted); font-size: .92rem; min-height: 1.4em; margin-top: 10px; }
+    .status { color: var(--muted); font-size: .92rem; min-height: 1.4em; margin: 10px 0 0; display: flex; align-items: center; gap: 8px; }
     .status.error { color: #ff8a8a; }
-    .thumbs { display: flex; gap: 6px; overflow-x: auto; margin-top: 12px; }
-    .thumbs canvas { width: 72px; height: 72px; object-fit: cover; border-radius: 8px; flex: none; border: 1px solid var(--border); }
+    .spinner {
+      width: 16px; height: 16px; flex: none;
+      border: 2px solid var(--border); border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin .8s linear infinite;
+    }
+    .spinner[hidden] { display: none; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 2.4s; } }
+    .thumbs { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+    .thumbs:empty { display: none; }
+    .thumbs canvas { width: 64px; height: 64px; border-radius: 8px; border: 1px solid var(--border); }
     #view {
       display: block;
       width: 100%;
@@ -57,6 +69,7 @@
       background: #000;
       touch-action: none;
     }
+    .placeholder { color: var(--muted); text-align: center; padding: 40px 0 0; }
     .controls { display: grid; grid-template-columns: 1fr; gap: 10px; margin-top: 10px; }
     @media (min-width: 620px) { .controls { grid-template-columns: 1fr 1fr; } }
     label { display: flex; flex-direction: column; gap: 4px; font-size: .9rem; color: var(--muted); }
@@ -65,7 +78,6 @@
     .foot { color: var(--muted); font-size: .85rem; margin: 18px 0 32px; }
     code { background: #22242b; padding: 1px 5px; border-radius: 5px; }
   </style>
-  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.min.js"></script>
   <script type="importmap">
     { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
   </script>
@@ -76,12 +88,14 @@
 
   <div class="panel">
     <div class="row">
-      <label class="button primary" for="files">Choose photos or video</label>
+      <label class="button primary" id="chooseLabel" for="files">Choose photos or video</label>
       <input type="file" id="files" accept="image/*,video/*" multiple>
-      <span class="status" id="backend"></span>
+      <button class="primary" id="generate" disabled>Generate 3D</button>
     </div>
-    <div class="status" id="status">Pick 3 to 8 photos from different angles, or one short video that walks around the object.</div>
+    <div class="status" id="status">Pick 4 to 8 photos from different angles, or one short video that walks around the object. One photo also works, but it only gives the visible side.</div>
+    <div class="status" id="working" hidden><span class="spinner"></span><span id="workingText"></span></div>
     <div class="thumbs" id="thumbs"></div>
+    <div class="status" id="backend"></div>
   </div>
 
   <div class="panel">
@@ -101,9 +115,9 @@
   </div>
 
   <p class="foot">
-    Runs fully on this device. The model file (<code>model/da3-small-fp16.onnx</code>) is loaded once and cached by the browser.
-    Frames are squashed to 504×504 before inference, and the cloud uses the model's own camera poses to place each view in one space.
-    Depth Anything 3 is Apache-2.0 (DA3-SMALL weights).
+    Runs fully on this device. The model file (<code>model/da3-small-fp16.onnx</code>) is downloaded once (about 56 MB) and cached by the browser.
+    Each photo is letterboxed to 504×504 so its proportions are kept. The cloud uses the model's own camera poses to place each view in one space.
+    Depth Anything 3 weights (DA3-SMALL) are Apache-2.0.
   </p>
 
   <script type="module">
@@ -116,16 +130,16 @@
     const MODEL_URL = "model/da3-small-fp16.onnx";
     const MAX_VIEWS = 8;
     const MAX_POINTS = 600000;
+    const PAD_GREY = "#808080";
     const MEAN = [0.485, 0.456, 0.406];
     const STD = [0.229, 0.224, 0.225];
 
-    // GitHub Pages cannot send the COOP/COEP headers that threads need.
-    ort.env.wasm.numThreads = 1;
-    ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/";
-
     const $ = (id) => document.getElementById(id);
     const fileEl = $("files");
+    const generateBtn = $("generate");
     const statusEl = $("status");
+    const workingEl = $("working");
+    const workingText = $("workingText");
     const backendEl = $("backend");
     const thumbsEl = $("thumbs");
     const keepEl = $("keep");
@@ -133,10 +147,11 @@
     const downloadBtn = $("download");
     const resetBtn = $("reset");
 
-    let cloud = null;      // raw per-pixel data from the last run
-    let shown = null;      // what is currently on screen, used for export
+    let cloud = null;        // raw per-pixel data from the last run
+    let shown = null;        // what is currently on screen, used for export
     let radius = 1;
-    let sessionPromise = null;
+    let pendingViews = null; // letterboxed views waiting for the Generate button
+    let busy = false;
 
     // ---------- three.js scene ----------
     const canvas = $("view");
@@ -165,68 +180,83 @@
       renderer.render(scene, camera);
     });
 
-    // ---------- model loading ----------
+    // ---------- status UI ----------
     const setStatus = (text, isError = false) => {
       statusEl.textContent = text;
       statusEl.classList.toggle("error", isError);
     };
     const mb = (bytes) => (bytes / 1e6).toFixed(1);
 
-    async function openCache() {
-      try { return await caches.open("da3-model-v1"); } catch { return null; }
+    let timer = null;
+    let phaseLabel = "";
+    function showWorking(label) {
+      const t0 = performance.now();
+      phaseLabel = label;
+      const render = () => {
+        const secs = Math.floor((performance.now() - t0) / 1000);
+        workingText.textContent = `${phaseLabel} ${secs} s`;
+      };
+      render();
+      workingEl.hidden = false;
+      timer = setInterval(render, 1000);
+    }
+    function setPhase(label) {
+      phaseLabel = label;
+    }
+    function hideWorking() {
+      clearInterval(timer);
+      timer = null;
+      workingEl.hidden = true;
     }
 
-    async function fetchModel(url, onProgress) {
-      const cache = await openCache();
-      const cached = cache && (await cache.match(url).catch(() => null));
-      if (cached) return new Uint8Array(await cached.arrayBuffer());
+    function setBusy(on) {
+      busy = on;
+      fileEl.disabled = on;
+      $("chooseLabel").classList.toggle("disabled", on);
+      generateBtn.disabled = on || !pendingViews;
+      if (!on) hideWorking();
+    }
 
-      const resp = await fetch(url);
-      if (!resp.ok) throw new Error(`Model download failed (HTTP ${resp.status})`);
-      const total = Number(resp.headers.get("content-length")) || 0;
-      const reader = resp.body.getReader();
-      const chunks = [];
-      let received = 0;
-      for (;;) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        chunks.push(value);
-        received += value.length;
-        onProgress(received, total);
+    // ---------- worker (model runs off the main thread) ----------
+    const worker = new Worker("worker.js");
+    const pending = new Map();
+    let nextId = 1;
+
+    worker.onmessage = (e) => {
+      const m = e.data;
+      const req = pending.get(m.id);
+      if (!req) return;
+      if (m.type === "progress") {
+        req.onProgress?.(m.done, m.total);
+        return;
       }
-      const bytes = new Uint8Array(received);
-      let offset = 0;
-      for (const c of chunks) { bytes.set(c, offset); offset += c.length; }
-      if (cache) cache.put(url, new Response(bytes.slice())).catch(() => {});
-      return bytes;
-    }
+      pending.delete(m.id);
+      if (m.type === "error") req.reject(new Error(m.message));
+      else req.resolve(m);
+    };
+    worker.onerror = (e) => {
+      for (const req of pending.values()) req.reject(new Error(e.message || "worker failed"));
+      pending.clear();
+    };
 
-    async function createSession() {
-      setStatus("Loading model…");
-      const bytes = await fetchModel(MODEL_URL, (done, total) => {
-        setStatus(`Loading model… ${mb(done)}${total ? " / " + mb(total) : ""} MB`);
+    function callWorker(msg, transfer = [], onProgress = null) {
+      const id = nextId++;
+      return new Promise((resolve, reject) => {
+        pending.set(id, { resolve, reject, onProgress });
+        worker.postMessage({ id, ...msg }, transfer);
       });
-      const providers = "gpu" in navigator ? ["webgpu", "wasm"] : ["wasm"];
-      for (const ep of providers) {
-        try {
-          const session = await ort.InferenceSession.create(bytes, {
-            executionProviders: [ep],
-            graphOptimizationLevel: "all",
-          });
-          backendEl.textContent = `Backend: ${ep === "webgpu" ? "WebGPU" : "WebAssembly (CPU)"}`;
-          return session;
-        } catch (err) {
-          console.warn(`${ep} backend unavailable`, err);
-        }
-      }
-      throw new Error("Could not start the model on this device");
     }
 
-    function getSession() {
-      if (!sessionPromise) {
-        sessionPromise = createSession().catch((err) => { sessionPromise = null; throw err; });
+    let loaded = null;
+    function ensureModel() {
+      if (!loaded) {
+        loaded = callWorker({ type: "load", url: MODEL_URL }, [], (done, total) => {
+          setPhase(`Loading model… ${mb(done)}${total ? " / " + mb(total) : ""} MB.`);
+        }).then((m) => {
+          backendEl.textContent = `Backend: ${m.backend === "webgpu" ? "WebGPU" : "WebAssembly (CPU)"}`;
+        }).catch((err) => { loaded = null; throw err; });
       }
-      return sessionPromise;
+      return loaded;
     }
 
     // ---------- input frames ----------
@@ -267,7 +297,7 @@
       return Array.from({ length: n }, (_, i) => items[Math.round((i * (items.length - 1)) / (n - 1))]);
     }
 
-    async function collectViews(files) {
+    async function collectSources(files) {
       const sources = [];
       for (const f of files) {
         if (f.type.startsWith("video/")) {
@@ -279,18 +309,28 @@
       return sampleEvenly(sources, MAX_VIEWS);
     }
 
-    // Squash to RES x RES. The model predicts its own intrinsics for this
-    // frame, so the aspect change does not need to be undone later.
+    // Letterbox to RES x RES, keeping the photo's proportions. The padding is
+    // grey, and `inside` marks the real photo pixels so padding never becomes points.
     function toView(src) {
+      const w = src.width, h = src.height;
+      const s = RES / Math.max(w, h);
+      const dw = Math.round(w * s), dh = Math.round(h * s);
+      const ox = Math.floor((RES - dw) / 2), oy = Math.floor((RES - dh) / 2);
+
       const cv = document.createElement("canvas");
       cv.width = cv.height = RES;
       const ctx = cv.getContext("2d", { willReadFrequently: true });
-      ctx.drawImage(src, 0, 0, RES, RES);
-      return { thumb: cv, rgba: ctx.getImageData(0, 0, RES, RES).data };
+      ctx.fillStyle = PAD_GREY;
+      ctx.fillRect(0, 0, RES, RES);
+      ctx.drawImage(src, ox, oy, dw, dh);
+
+      const inside = new Uint8Array(P);
+      for (let y = oy; y < oy + dh; y++) inside.fill(1, y * RES + ox, y * RES + ox + dw);
+      return { thumb: cv, rgba: ctx.getImageData(0, 0, RES, RES).data, inside };
     }
 
     // ---------- inference ----------
-    async function runModel(views) {
+    async function runModel(views, onReady) {
       const V = views.length;
       const input = new Float32Array(V * 3 * P);
       for (let v = 0; v < V; v++) {
@@ -301,9 +341,10 @@
           }
         }
       }
-      const session = await getSession();
-      const feeds = { images: new ort.Tensor("float32", input, [1, V, 3, RES, RES]) };
-      return session.run(feeds);
+      await ensureModel();
+      onReady?.();
+      const reply = await callWorker({ type: "run", input, V }, [input.buffer]);
+      return reply.result;
     }
 
     // ---------- point cloud ----------
@@ -313,10 +354,10 @@
     // cloud sits upright in three.js (y up, z toward the viewer).
     function buildCloud(views, out) {
       const V = views.length;
-      const depth = out.depth.data;
-      const conf = out.depth_conf.data;
-      const ext = out.extrinsics.data;
-      const K = out.intrinsics.data;
+      const depth = out.depth;
+      const conf = out.depth_conf;
+      const ext = out.extrinsics;
+      const K = out.intrinsics;
       const N = V * P;
       const pos = new Float32Array(N * 3);
       const col = new Float32Array(N * 3);
@@ -330,11 +371,12 @@
         const r10 = ext[e + 4], r11 = ext[e + 5], r12 = ext[e + 6], t1 = ext[e + 7];
         const r20 = ext[e + 8], r21 = ext[e + 9], r22 = ext[e + 10], t2 = ext[e + 11];
         const fx = K[k], fy = K[k + 4], cx = K[k + 2], cy = K[k + 5];
-        const rgba = views[v].rgba;
+        const { rgba, inside } = views[v];
 
         for (let y = 0; y < RES; y++) {
           for (let x = 0; x < RES; x++) {
             const i = y * RES + x;
+            if (!inside[i]) continue;
             const g = v * P + i;
             const d = depth[g];
             if (!(d > 0) || !Number.isFinite(d)) continue;
@@ -391,8 +433,8 @@
       geometry.setAttribute("color", new THREE.BufferAttribute(dc, 3));
       geometry.computeBoundingSphere();
 
-      // Centre on the median-ish centre and size from the 90th-percentile
-      // distance, so a few stray far points do not zoom the view out.
+      // Centre on the mean and size from the 90th-percentile distance, so a few
+      // stray far points do not zoom the view out.
       const centre = new THREE.Vector3();
       for (let i = 0; i < outN; i++) {
         centre.x += dp[i * 3]; centre.y += dp[i * 3 + 1]; centre.z += dp[i * 3 + 2];
@@ -459,32 +501,49 @@
     }
 
     // ---------- UI wiring ----------
+    // Step 1: picking files only prepares the frames and shows thumbnails.
     fileEl.addEventListener("change", async () => {
       const files = [...fileEl.files];
-      if (!files.length) return;
-      fileEl.disabled = true;
+      fileEl.value = "";
+      if (!files.length || busy) return;
       try {
         setStatus("Reading photos or video…");
-        const sources = await collectViews(files);
-        if (sources.length < 1) throw new Error("No images or video frames found in that selection");
-        const views = sources.map(toView);
+        const sources = await collectSources(files);
+        if (!sources.length) throw new Error("No images or video frames found in that selection");
+        pendingViews = sources.map(toView);
+        thumbsEl.replaceChildren(...pendingViews.map((v) => v.thumb));
+        generateBtn.disabled = false;
+        setStatus(`${pendingViews.length} frame${pendingViews.length > 1 ? "s" : ""} ready. Check the thumbnails, then press Generate 3D.`);
+      } catch (err) {
+        console.error(err);
+        pendingViews = null;
+        generateBtn.disabled = true;
+        setStatus(`Could not read that selection: ${err.message}`, true);
+      }
+    });
 
-        thumbsEl.replaceChildren(...views.map((v) => v.thumb));
-        setStatus(`Running Depth Anything 3 on ${views.length} view${views.length > 1 ? "s" : ""}…`);
-        const t0 = performance.now();
-        const out = await runModel(views);
-        const secs = ((performance.now() - t0) / 1000).toFixed(1);
+    // Step 2: the Generate button starts the model, with a spinner and timer.
+    generateBtn.addEventListener("click", async () => {
+      if (!pendingViews || busy) return;
+      const views = pendingViews;
+      setBusy(true);
+      try {
+        const V = views.length;
+        const label = `Generating 3D from ${V} view${V > 1 ? "s" : ""}…`;
+        setStatus("Working. This can take a minute on a phone. Keep this tab open.");
+        showWorking(`Loading model…`);
+        const out = await runModel(views, () => setPhase(label));
 
-        setStatus(`Model finished in ${secs} s. Building point cloud…`);
+        hideWorking();
+        setStatus("Model finished. Building point cloud…");
         cloud = buildCloud(views, out);
         applyFilter(true);
-        setStatus(`Done: ${shown.n.toLocaleString()} points from ${views.length} view${views.length > 1 ? "s" : ""}. Drag to rotate, pinch to zoom.`);
+        setStatus(`Done: ${shown.n.toLocaleString()} points from ${V} view${V > 1 ? "s" : ""}. Drag to rotate, pinch to zoom.`);
       } catch (err) {
         console.error(err);
         setStatus(`Something went wrong: ${err.message}`, true);
       } finally {
-        fileEl.disabled = false;
-        fileEl.value = "";
+        setBusy(false);
       }
     });
 
