@@ -1,0 +1,11 @@
+torch>=2.5
+onnx
+onnxruntime
+onnxscript
+onnxconverter-common
+numpy<2
+omegaconf
+einops
+safetensors
+huggingface_hub
+addict

@@ -1,0 +1,497 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Object to 3D · Depth Anything 3 in the browser</title>
+  <meta name="description" content="Capture a few photos or a short video of an object and get a 3D point cloud, computed on your device with Depth Anything 3 (small).">
+  <style>
+    :root {
+      --bg: #0e0f12;
+      --panel: #17181d;
+      --fg: #e8e8ea;
+      --muted: #9a9ca3;
+      --accent: #7aa2ff;
+      --border: #2a2c33;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; background: var(--bg); color: var(--fg); }
+    body {
+      font: 16px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      padding: env(safe-area-inset-top) 16px env(safe-area-inset-bottom);
+      max-width: 880px;
+      margin-inline: auto;
+    }
+    h1 { font-size: 1.35rem; margin: 20px 0 4px; }
+    p.lead { color: var(--muted); margin: 0 0 16px; }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+      margin-bottom: 14px;
+    }
+    button, .button {
+      font: inherit;
+      color: var(--fg);
+      background: #232630;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 14px;
+      cursor: pointer;
+    }
+    button.primary, .button.primary { background: var(--accent); color: #0b1020; border-color: transparent; font-weight: 600; }
+    button:disabled { opacity: .5; cursor: default; }
+    input[type="file"] { display: none; }
+    .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+    .status { color: var(--muted); font-size: .92rem; min-height: 1.4em; margin-top: 10px; }
+    .status.error { color: #ff8a8a; }
+    .thumbs { display: flex; gap: 6px; overflow-x: auto; margin-top: 12px; }
+    .thumbs canvas { width: 72px; height: 72px; object-fit: cover; border-radius: 8px; flex: none; border: 1px solid var(--border); }
+    #view {
+      display: block;
+      width: 100%;
+      height: min(70vh, 620px);
+      min-height: 320px;
+      border-radius: 12px;
+      background: #000;
+      touch-action: none;
+    }
+    .controls { display: grid; grid-template-columns: 1fr; gap: 10px; margin-top: 10px; }
+    @media (min-width: 620px) { .controls { grid-template-columns: 1fr 1fr; } }
+    label { display: flex; flex-direction: column; gap: 4px; font-size: .9rem; color: var(--muted); }
+    label span b { color: var(--fg); font-weight: 600; }
+    input[type="range"] { width: 100%; accent-color: var(--accent); }
+    .foot { color: var(--muted); font-size: .85rem; margin: 18px 0 32px; }
+    code { background: #22242b; padding: 1px 5px; border-radius: 5px; }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.min.js"></script>
+  <script type="importmap">
+    { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+  </script>
+</head>
+<body>
+  <h1>Object to 3D</h1>
+  <p class="lead">Take a few photos of an object from different sides, or pick a short video. Depth Anything 3 (small) runs on this device and builds a point cloud you can rotate.</p>
+
+  <div class="panel">
+    <div class="row">
+      <label class="button primary" for="files">Choose photos or video</label>
+      <input type="file" id="files" accept="image/*,video/*" multiple>
+      <span class="status" id="backend"></span>
+    </div>
+    <div class="status" id="status">Pick 3 to 8 photos from different angles, or one short video that walks around the object.</div>
+    <div class="thumbs" id="thumbs"></div>
+  </div>
+
+  <div class="panel">
+    <canvas id="view"></canvas>
+    <div class="controls">
+      <label for="keep">Points kept: <span><b id="keepVal">60</b>%</span>
+        <input type="range" id="keep" min="5" max="100" value="60">
+      </label>
+      <label for="size">Point size: <span><b id="sizeVal">4</b></span>
+        <input type="range" id="size" min="1" max="12" value="4">
+      </label>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <button id="download" disabled>Download .ply</button>
+      <button id="reset" disabled>Reset view</button>
+    </div>
+  </div>
+
+  <p class="foot">
+    Runs fully on this device. The model file (<code>model/da3-small-fp16.onnx</code>) is loaded once and cached by the browser.
+    Frames are squashed to 504×504 before inference, and the cloud uses the model's own camera poses to place each view in one space.
+    Depth Anything 3 is Apache-2.0 (DA3-SMALL weights).
+  </p>
+
+  <script type="module">
+    import * as THREE from "three";
+    import { OrbitControls } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js";
+
+    // Must match --res passed to tools/export_onnx.py
+    const RES = 504;
+    const P = RES * RES;
+    const MODEL_URL = "model/da3-small-fp16.onnx";
+    const MAX_VIEWS = 8;
+    const MAX_POINTS = 600000;
+    const MEAN = [0.485, 0.456, 0.406];
+    const STD = [0.229, 0.224, 0.225];
+
+    // GitHub Pages cannot send the COOP/COEP headers that threads need.
+    ort.env.wasm.numThreads = 1;
+    ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/";
+
+    const $ = (id) => document.getElementById(id);
+    const fileEl = $("files");
+    const statusEl = $("status");
+    const backendEl = $("backend");
+    const thumbsEl = $("thumbs");
+    const keepEl = $("keep");
+    const sizeEl = $("size");
+    const downloadBtn = $("download");
+    const resetBtn = $("reset");
+
+    let cloud = null;      // raw per-pixel data from the last run
+    let shown = null;      // what is currently on screen, used for export
+    let radius = 1;
+    let sessionPromise = null;
+
+    // ---------- three.js scene ----------
+    const canvas = $("view");
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0e0f12);
+    const camera = new THREE.PerspectiveCamera(50, 1, 0.001, 1000);
+    const controls = new OrbitControls(camera, canvas);
+    controls.enableDamping = true;
+    const geometry = new THREE.BufferGeometry();
+    const material = new THREE.PointsMaterial({ size: 0.01, vertexColors: true, sizeAttenuation: true });
+    const points = new THREE.Points(geometry, material);
+    scene.add(points);
+
+    function resize() {
+      const w = canvas.clientWidth, h = canvas.clientHeight;
+      renderer.setSize(w, h, false);
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    }
+    window.addEventListener("resize", resize);
+    resize();
+    renderer.setAnimationLoop(() => {
+      controls.update();
+      renderer.render(scene, camera);
+    });
+
+    // ---------- model loading ----------
+    const setStatus = (text, isError = false) => {
+      statusEl.textContent = text;
+      statusEl.classList.toggle("error", isError);
+    };
+    const mb = (bytes) => (bytes / 1e6).toFixed(1);
+
+    async function openCache() {
+      try { return await caches.open("da3-model-v1"); } catch { return null; }
+    }
+
+    async function fetchModel(url, onProgress) {
+      const cache = await openCache();
+      const cached = cache && (await cache.match(url).catch(() => null));
+      if (cached) return new Uint8Array(await cached.arrayBuffer());
+
+      const resp = await fetch(url);
+      if (!resp.ok) throw new Error(`Model download failed (HTTP ${resp.status})`);
+      const total = Number(resp.headers.get("content-length")) || 0;
+      const reader = resp.body.getReader();
+      const chunks = [];
+      let received = 0;
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        received += value.length;
+        onProgress(received, total);
+      }
+      const bytes = new Uint8Array(received);
+      let offset = 0;
+      for (const c of chunks) { bytes.set(c, offset); offset += c.length; }
+      if (cache) cache.put(url, new Response(bytes.slice())).catch(() => {});
+      return bytes;
+    }
+
+    async function createSession() {
+      setStatus("Loading model…");
+      const bytes = await fetchModel(MODEL_URL, (done, total) => {
+        setStatus(`Loading model… ${mb(done)}${total ? " / " + mb(total) : ""} MB`);
+      });
+      const providers = "gpu" in navigator ? ["webgpu", "wasm"] : ["wasm"];
+      for (const ep of providers) {
+        try {
+          const session = await ort.InferenceSession.create(bytes, {
+            executionProviders: [ep],
+            graphOptimizationLevel: "all",
+          });
+          backendEl.textContent = `Backend: ${ep === "webgpu" ? "WebGPU" : "WebAssembly (CPU)"}`;
+          return session;
+        } catch (err) {
+          console.warn(`${ep} backend unavailable`, err);
+        }
+      }
+      throw new Error("Could not start the model on this device");
+    }
+
+    function getSession() {
+      if (!sessionPromise) {
+        sessionPromise = createSession().catch((err) => { sessionPromise = null; throw err; });
+      }
+      return sessionPromise;
+    }
+
+    // ---------- input frames ----------
+    const waitFor = (el, evt) => new Promise((resolve, reject) => {
+      const onError = () => reject(new Error(`video ${evt} failed`));
+      el.addEventListener(evt, () => { el.removeEventListener("error", onError); resolve(); }, { once: true });
+      el.addEventListener("error", onError, { once: true });
+    });
+
+    async function framesFromVideo(file, n) {
+      const video = document.createElement("video");
+      video.muted = true;
+      video.playsInline = true;
+      video.preload = "auto";
+      const url = URL.createObjectURL(file);
+      video.src = url;
+      try {
+        await waitFor(video, "loadeddata");
+        const cv = document.createElement("canvas");
+        cv.width = video.videoWidth;
+        cv.height = video.videoHeight;
+        const ctx = cv.getContext("2d");
+        const frames = [];
+        for (let i = 0; i < n; i++) {
+          video.currentTime = (video.duration * (i + 0.5)) / n;
+          await waitFor(video, "seeked");
+          ctx.drawImage(video, 0, 0, cv.width, cv.height);
+          frames.push(await createImageBitmap(cv));
+        }
+        return frames;
+      } finally {
+        URL.revokeObjectURL(url);
+      }
+    }
+
+    function sampleEvenly(items, n) {
+      if (items.length <= n) return items;
+      return Array.from({ length: n }, (_, i) => items[Math.round((i * (items.length - 1)) / (n - 1))]);
+    }
+
+    async function collectViews(files) {
+      const sources = [];
+      for (const f of files) {
+        if (f.type.startsWith("video/")) {
+          sources.push(...(await framesFromVideo(f, MAX_VIEWS)));
+        } else if (f.type.startsWith("image/")) {
+          sources.push(await createImageBitmap(f, { imageOrientation: "from-image" }));
+        }
+      }
+      return sampleEvenly(sources, MAX_VIEWS);
+    }
+
+    // Squash to RES x RES. The model predicts its own intrinsics for this
+    // frame, so the aspect change does not need to be undone later.
+    function toView(src) {
+      const cv = document.createElement("canvas");
+      cv.width = cv.height = RES;
+      const ctx = cv.getContext("2d", { willReadFrequently: true });
+      ctx.drawImage(src, 0, 0, RES, RES);
+      return { thumb: cv, rgba: ctx.getImageData(0, 0, RES, RES).data };
+    }
+
+    // ---------- inference ----------
+    async function runModel(views) {
+      const V = views.length;
+      const input = new Float32Array(V * 3 * P);
+      for (let v = 0; v < V; v++) {
+        const px = views[v].rgba;
+        for (let i = 0; i < P; i++) {
+          for (let c = 0; c < 3; c++) {
+            input[v * 3 * P + c * P + i] = (px[i * 4 + c] / 255 - MEAN[c]) / STD[c];
+          }
+        }
+      }
+      const session = await getSession();
+      const feeds = { images: new ort.Tensor("float32", input, [1, V, 3, RES, RES]) };
+      return session.run(feeds);
+    }
+
+    // ---------- point cloud ----------
+    // Unproject every valid pixel with its predicted depth and camera pose.
+    // Extrinsics are world-to-camera, so world = R^T (X_cam - t).
+    // The output is in OpenCV axes (y down, z forward). Flip y and z so the
+    // cloud sits upright in three.js (y up, z toward the viewer).
+    function buildCloud(views, out) {
+      const V = views.length;
+      const depth = out.depth.data;
+      const conf = out.depth_conf.data;
+      const ext = out.extrinsics.data;
+      const K = out.intrinsics.data;
+      const N = V * P;
+      const pos = new Float32Array(N * 3);
+      const col = new Float32Array(N * 3);
+      const cf = new Float32Array(N);
+      const valid = new Uint8Array(N);
+      const sample = [];
+
+      for (let v = 0; v < V; v++) {
+        const e = v * 12, k = v * 9;
+        const r00 = ext[e], r01 = ext[e + 1], r02 = ext[e + 2], t0 = ext[e + 3];
+        const r10 = ext[e + 4], r11 = ext[e + 5], r12 = ext[e + 6], t1 = ext[e + 7];
+        const r20 = ext[e + 8], r21 = ext[e + 9], r22 = ext[e + 10], t2 = ext[e + 11];
+        const fx = K[k], fy = K[k + 4], cx = K[k + 2], cy = K[k + 5];
+        const rgba = views[v].rgba;
+
+        for (let y = 0; y < RES; y++) {
+          for (let x = 0; x < RES; x++) {
+            const i = y * RES + x;
+            const g = v * P + i;
+            const d = depth[g];
+            if (!(d > 0) || !Number.isFinite(d)) continue;
+
+            const ax = ((x - cx) / fx) * d - t0;
+            const ay = ((y - cy) / fy) * d - t1;
+            const az = d - t2;
+            const wx = r00 * ax + r10 * ay + r20 * az;
+            const wy = r01 * ax + r11 * ay + r21 * az;
+            const wz = r02 * ax + r12 * ay + r22 * az;
+
+            pos[g * 3] = wx;
+            pos[g * 3 + 1] = -wy;
+            pos[g * 3 + 2] = -wz;
+            col[g * 3] = rgba[i * 4] / 255;
+            col[g * 3 + 1] = rgba[i * 4 + 1] / 255;
+            col[g * 3 + 2] = rgba[i * 4 + 2] / 255;
+            cf[g] = conf[g];
+            valid[g] = 1;
+            if (sample.length < 200000 && (g & 3) === 0) sample.push(conf[g]);
+          }
+        }
+      }
+      sample.sort((a, b) => a - b);
+      return { pos, col, cf, valid, N, sortedConf: sample };
+    }
+
+    function applyFilter(fitView) {
+      if (!cloud) return;
+      const keep = Number(keepEl.value) / 100;
+      const { pos, col, cf, valid, N, sortedConf } = cloud;
+      const thr = keep >= 0.999 || sortedConf.length === 0
+        ? -Infinity
+        : sortedConf[Math.floor((1 - keep) * (sortedConf.length - 1))];
+
+      let count = 0;
+      for (let g = 0; g < N; g++) if (valid[g] && cf[g] >= thr) count++;
+      const stride = Math.max(1, Math.ceil(count / MAX_POINTS));
+      const outN = Math.ceil(count / stride);
+
+      const dp = new Float32Array(outN * 3);
+      const dc = new Float32Array(outN * 3);
+      let seen = 0, o = 0;
+      for (let g = 0; g < N && o < outN; g++) {
+        if (!valid[g] || cf[g] < thr) continue;
+        if (seen++ % stride !== 0) continue;
+        dp[o * 3] = pos[g * 3]; dp[o * 3 + 1] = pos[g * 3 + 1]; dp[o * 3 + 2] = pos[g * 3 + 2];
+        dc[o * 3] = col[g * 3]; dc[o * 3 + 1] = col[g * 3 + 1]; dc[o * 3 + 2] = col[g * 3 + 2];
+        o++;
+      }
+      shown = { pos: dp, col: dc, n: outN };
+
+      geometry.setAttribute("position", new THREE.BufferAttribute(dp, 3));
+      geometry.setAttribute("color", new THREE.BufferAttribute(dc, 3));
+      geometry.computeBoundingSphere();
+
+      // Centre on the median-ish centre and size from the 90th-percentile
+      // distance, so a few stray far points do not zoom the view out.
+      const centre = new THREE.Vector3();
+      for (let i = 0; i < outN; i++) {
+        centre.x += dp[i * 3]; centre.y += dp[i * 3 + 1]; centre.z += dp[i * 3 + 2];
+      }
+      if (outN) centre.divideScalar(outN);
+      const dists = [];
+      for (let i = 0; i < outN; i += Math.max(1, Math.floor(outN / 20000))) {
+        dists.push(Math.hypot(dp[i * 3] - centre.x, dp[i * 3 + 1] - centre.y, dp[i * 3 + 2] - centre.z));
+      }
+      dists.sort((a, b) => a - b);
+      radius = dists.length ? Math.max(dists[Math.floor(dists.length * 0.9)], 1e-6) : 1;
+
+      points.position.copy(centre).negate();
+      updateSize();
+      if (fitView) {
+        controls.target.set(0, 0, 0);
+        camera.position.set(0, 0, radius * 2.8);
+        camera.near = radius / 100;
+        camera.far = radius * 100;
+        camera.updateProjectionMatrix();
+        controls.update();
+      }
+      $("keepVal").textContent = Math.round(keep * 100);
+      downloadBtn.disabled = outN === 0;
+      resetBtn.disabled = false;
+    }
+
+    function updateSize() {
+      const v = Number(sizeEl.value);
+      $("sizeVal").textContent = v;
+      material.size = radius * v * 0.0025;
+      material.needsUpdate = true;
+    }
+
+    function downloadPly() {
+      if (!shown) return;
+      const { pos, col, n } = shown;
+      const header =
+        "ply\nformat binary_little_endian 1.0\n" +
+        `element vertex ${n}\n` +
+        "property float x\nproperty float y\nproperty float z\n" +
+        "property uchar red\nproperty uchar green\nproperty uchar blue\n" +
+        "end_header\n";
+      const head = new TextEncoder().encode(header);
+      const buf = new ArrayBuffer(head.length + n * 15);
+      new Uint8Array(buf).set(head, 0);
+      const dv = new DataView(buf);
+      let o = head.length;
+      for (let i = 0; i < n; i++) {
+        dv.setFloat32(o, pos[i * 3], true);
+        dv.setFloat32(o + 4, pos[i * 3 + 1], true);
+        dv.setFloat32(o + 8, pos[i * 3 + 2], true);
+        dv.setUint8(o + 12, Math.round(col[i * 3] * 255));
+        dv.setUint8(o + 13, Math.round(col[i * 3 + 1] * 255));
+        dv.setUint8(o + 14, Math.round(col[i * 3 + 2] * 255));
+        o += 15;
+      }
+      const url = URL.createObjectURL(new Blob([buf], { type: "application/octet-stream" }));
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "object.ply";
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+    }
+
+    // ---------- UI wiring ----------
+    fileEl.addEventListener("change", async () => {
+      const files = [...fileEl.files];
+      if (!files.length) return;
+      fileEl.disabled = true;
+      try {
+        setStatus("Reading photos or video…");
+        const sources = await collectViews(files);
+        if (sources.length < 1) throw new Error("No images or video frames found in that selection");
+        const views = sources.map(toView);
+
+        thumbsEl.replaceChildren(...views.map((v) => v.thumb));
+        setStatus(`Running Depth Anything 3 on ${views.length} view${views.length > 1 ? "s" : ""}…`);
+        const t0 = performance.now();
+        const out = await runModel(views);
+        const secs = ((performance.now() - t0) / 1000).toFixed(1);
+
+        setStatus(`Model finished in ${secs} s. Building point cloud…`);
+        cloud = buildCloud(views, out);
+        applyFilter(true);
+        setStatus(`Done: ${shown.n.toLocaleString()} points from ${views.length} view${views.length > 1 ? "s" : ""}. Drag to rotate, pinch to zoom.`);
+      } catch (err) {
+        console.error(err);
+        setStatus(`Something went wrong: ${err.message}`, true);
+      } finally {
+        fileEl.disabled = false;
+        fileEl.value = "";
+      }
+    });
+
+    keepEl.addEventListener("input", () => applyFilter(false));
+    sizeEl.addEventListener("input", updateSize);
+    downloadBtn.addEventListener("click", downloadPly);
+    resetBtn.addEventListener("click", () => applyFilter(true));
+  </script>
+</body>
+</html>
