@@ -1,6 +1,6 @@
 // Runs the ONNX model off the main thread so the page stays responsive.
 // In:  {id, type:'load', prefer} | {id, type:'run', input, V, prefer}
-//      prefer: "auto" (WebGPU, then CPU) | "webgpu" | "cpu"
+//      res: 504 | 336 (picks the model file), prefer: "auto" (WebGPU, then CPU) | "webgpu" | "cpu"
 // Out: {type:'log', level, msg, data}                      (diagnostics, any time)
 //      {id, type:'progress', done, total} | {id, type:'progress', phase:'infer'}
 //      {id, type:'done', backend, result?, stats?, timings?}
@@ -13,12 +13,13 @@ ort.env.wasm.numThreads = 1;
 ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/";
 
 const WORKER_BUILD = "debug-3";
-const RES = 504;
-const MODEL_URL = "model/da3-small-fp16.onnx";
+// Model file per input size. Two models so phones can run 3+ views at 336.
+const MODELS = { 504: "model/da3-small-fp16.onnx", 336: "model/da3-small-336-fp16.onnx" };
 const OUTPUTS = ["depth", "depth_conf", "extrinsics", "intrinsics"];
 
-let modelBytes = null;
+const modelBytesByRes = {};
 let session = null;
+let sessionRes = null;
 let sessionKind = null; // backend actually in use: "webgpu" | "wasm"
 let sessionPref = null; // what the page asked for
 
@@ -30,15 +31,18 @@ async function openCache() {
   try { return await caches.open("da3-model-v1"); } catch { return null; }
 }
 
-async function getModelBytes(id) {
-  if (modelBytes) return modelBytes;
+async function getModelBytes(res, id) {
+  const MODEL_URL = MODELS[res];
+  if (!MODEL_URL) throw new Error(`no model for ${res} px input`);
+  if (modelBytesByRes[res]) return modelBytesByRes[res];
   const t = now();
   const cache = await openCache();
   const cached = cache && (await cache.match(MODEL_URL).catch(() => null));
   if (cached) {
-    modelBytes = new Uint8Array(await cached.arrayBuffer());
-    log("info", "model read from browser cache", { bytes: modelBytes.length, ms: round(now() - t) });
-    return modelBytes;
+    const bytes = new Uint8Array(await cached.arrayBuffer());
+    modelBytesByRes[res] = bytes;
+    log("info", "model read from browser cache", { res, bytes: bytes.length, ms: round(now() - t) });
+    return bytes;
   }
 
   const resp = await fetch(MODEL_URL);
@@ -58,14 +62,14 @@ async function getModelBytes(id) {
   let offset = 0;
   for (const c of chunks) { bytes.set(c, offset); offset += c.length; }
   if (cache) cache.put(MODEL_URL, new Response(bytes.slice())).catch(() => {});
-  modelBytes = bytes;
-  log("info", "model downloaded", { bytes: received, ms: round(now() - t) });
+  modelBytesByRes[res] = bytes;
+  log("info", "model downloaded", { res, bytes: received, ms: round(now() - t) });
   return bytes;
 }
 
-async function ensureSession(pref, id) {
-  if (session && sessionPref === pref) return;
-  const bytes = await getModelBytes(id);
+async function ensureSession(pref, res, id) {
+  if (session && sessionPref === pref && sessionRes === res) return;
+  const bytes = await getModelBytes(res, id);
   if (session) {
     try { await session.release(); } catch { /* ignore */ }
     session = null;
@@ -85,6 +89,7 @@ async function ensureSession(pref, id) {
       });
       sessionKind = ep;
       sessionPref = pref;
+      sessionRes = res;
       log("info", `session ready on ${ep}`, { ms: round(now() - t) });
       return;
     } catch (err) {
@@ -106,8 +111,8 @@ function statsOf(a) {
   return { n: a.length, nonFinite, min: round(min), max: round(max) };
 }
 
-async function infer(input, V, id) {
-  const feeds = { images: new ort.Tensor("float32", input, [1, V, 3, RES, RES]) };
+async function infer(input, V, res, id) {
+  const feeds = { images: new ort.Tensor("float32", input, [1, V, 3, res, res]) };
   postMessage({ id, type: "progress", phase: "infer" });
   const t = now();
   const out = await session.run(feeds);
@@ -120,19 +125,19 @@ async function infer(input, V, id) {
 async function run(m) {
   const timings = {};
   let t = now();
-  await ensureSession(m.prefer, m.id);
+  await ensureSession(m.prefer, m.res, m.id);
   timings.sessionMs = round(now() - t);
 
   let fallback = null;
   let attempt;
   try {
-    attempt = await infer(m.input, m.V, m.id);
+    attempt = await infer(m.input, m.V, m.res, m.id);
   } catch (err) {
     if (sessionKind !== "webgpu") throw err;
     log("error", "WebGPU inference threw, retrying on CPU", { error: String((err && err.message) || err) });
     fallback = "webgpu-error";
-    await ensureSession("cpu", m.id);
-    attempt = await infer(m.input, m.V, m.id);
+    await ensureSession("cpu", m.res, m.id);
+    attempt = await infer(m.input, m.V, m.res, m.id);
   }
 
   let stats = {};
@@ -141,8 +146,8 @@ async function run(m) {
   if (broken && sessionKind === "webgpu") {
     log("warn", "WebGPU produced NaN/Infinity, retrying on CPU", stats);
     fallback = "non-finite-output";
-    await ensureSession("cpu", m.id);
-    attempt = await infer(m.input, m.V, m.id);
+    await ensureSession("cpu", m.res, m.id);
+    attempt = await infer(m.input, m.V, m.res, m.id);
     stats = {};
     for (const k of OUTPUTS) stats[k] = statsOf(attempt.result[k]);
   }
@@ -150,7 +155,7 @@ async function run(m) {
   timings.inferMs = attempt.ms;
   timings.backend = sessionKind;
   timings.fallback = fallback;
-  log("info", "inference finished", { backend: sessionKind, V: m.V, inferMs: attempt.ms, fallback, stats });
+  log("info", "inference finished", { backend: sessionKind, V: m.V, res: m.res, inferMs: attempt.ms, fallback, stats });
   return { result: attempt.result, stats, timings };
 }
 
@@ -158,7 +163,7 @@ self.onmessage = async (e) => {
   const m = e.data;
   try {
     if (m.type === "load") {
-      await ensureSession(m.prefer, m.id);
+      await ensureSession(m.prefer, m.res, m.id);
       postMessage({ id: m.id, type: "done", backend: sessionKind });
     } else if (m.type === "run") {
       const r = await run(m);

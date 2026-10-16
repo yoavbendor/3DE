@@ -158,9 +158,12 @@
 
     // ---------- constants ----------
     const BUILD = "debug-3";
-    // Must match --res passed to tools/export_onnx.py
-    const RES = 504;
-    const P = RES * RES;
+    // Must match --res passed to tools/export_onnx.py. One view or two use the
+    // full 504 model; three or more use the 336 model, because attention memory
+    // grows with (views x tokens)^2 and phones run out of memory at 504.
+    const RES_FULL = 504;
+    const RES_MULTI = 336;
+    const resFor = (V) => (V >= 3 ? RES_MULTI : RES_FULL);
     const MAX_VIEWS = 8;
     const MAX_POINTS = 600000;
     const PAD_GREY = "#808080";
@@ -190,7 +193,7 @@
     let cloud = null;        // raw per-pixel data from the last run
     let shown = null;        // what is currently on screen, used for export
     let radius = 1;
-    let pendingViews = null; // letterboxed views waiting for the Generate button
+    let pendingSources = null; // picked photos/frames waiting for the Generate button
     let busy = false;
     let runCounter = 0;
 
@@ -396,7 +399,7 @@
       fileEl.disabled = on;
       backendSel.disabled = on;
       $("chooseLabel").classList.toggle("disabled", on);
-      generateBtn.disabled = on || !pendingViews;
+      generateBtn.disabled = on || !pendingSources;
       if (!on) hideWorking();
     }
 
@@ -499,25 +502,35 @@
 
     // Letterbox to RES x RES, keeping the photo's proportions. The padding is
     // grey, and `inside` marks the real photo pixels so padding never becomes points.
-    function toView(src) {
+    function letterbox(src, res, canvas) {
       const w = src.width, h = src.height;
-      const s = RES / Math.max(w, h);
+      const s = res / Math.max(w, h);
       const dw = Math.round(w * s), dh = Math.round(h * s);
-      const ox = Math.floor((RES - dw) / 2), oy = Math.floor((RES - dh) / 2);
-
-      const cv = document.createElement("canvas");
-      cv.width = cv.height = RES;
-      const ctx = cv.getContext("2d", { willReadFrequently: true });
+      const ox = Math.floor((res - dw) / 2), oy = Math.floor((res - dh) / 2);
+      canvas.width = canvas.height = res;
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
       ctx.fillStyle = PAD_GREY;
-      ctx.fillRect(0, 0, RES, RES);
+      ctx.fillRect(0, 0, res, res);
       ctx.drawImage(src, ox, oy, dw, dh);
-
-      const inside = new Uint8Array(P);
-      for (let y = oy; y < oy + dh; y++) inside.fill(1, y * RES + ox, y * RES + ox + dw);
-      return { thumb: cv, rgba: ctx.getImageData(0, 0, RES, RES).data, inside, src: `${w}x${h}` };
+      return { ox, oy, dw, dh, ctx };
     }
 
-    function buildInput(views) {
+    function toView(src, res) {
+      const cv = document.createElement("canvas");
+      const { ox, oy, dw, dh, ctx } = letterbox(src, res, cv);
+      const inside = new Uint8Array(res * res);
+      for (let y = oy; y < oy + dh; y++) inside.fill(1, y * res + ox, y * res + ox + dw);
+      return { rgba: ctx.getImageData(0, 0, res, res).data, inside };
+    }
+
+    function makeThumb(src) {
+      const cv = document.createElement("canvas");
+      letterbox(src, 128, cv);
+      cv.style.width = cv.style.height = "64px";
+      return cv;
+    }
+
+    function buildInput(views, RES, P) {
       const V = views.length;
       const input = new Float32Array(V * 3 * P);
       for (let v = 0; v < V; v++) {
@@ -538,7 +551,7 @@
     // cloud sits upright in three.js (y up, z toward the viewer).
     // Points with non-finite coordinates are dropped and counted, because a
     // single NaN makes a whole view invisible.
-    function buildCloud(views, out) {
+    function buildCloud(views, out, RES, P) {
       const V = views.length;
       const depth = out.depth;
       const conf = out.depth_conf;
@@ -704,14 +717,14 @@
         const t = performance.now();
         const sources = await collectSources(files);
         if (!sources.length) throw new Error("No images or video frames found in that selection");
-        pendingViews = sources.map(toView);
-        log("info", "frames prepared", { views: pendingViews.length, sources: pendingViews.map((v) => v.src), ms: round(performance.now() - t) });
-        thumbsEl.replaceChildren(...pendingViews.map((v) => v.thumb));
+        pendingSources = sources;
+        log("info", "frames prepared", { views: sources.length, sources: sources.map((s) => `${s.width}x${s.height}`), ms: round(performance.now() - t) });
+        thumbsEl.replaceChildren(...sources.map(makeThumb));
         generateBtn.disabled = false;
-        setStatus(`${pendingViews.length} frame${pendingViews.length > 1 ? "s" : ""} ready. Check the thumbnails, then press Generate 3D.`);
+        setStatus(`${sources.length} frame${sources.length > 1 ? "s" : ""} ready. Check the thumbnails, then press Generate 3D.`);
       } catch (err) {
         log("error", "reading selection failed", { error: String(err && err.message || err) });
-        pendingViews = null;
+        pendingSources = null;
         generateBtn.disabled = true;
         setStatus(`Could not read that selection: ${err.message}`, true);
       }
@@ -719,15 +732,16 @@
 
     // Step 2: the Generate button starts the model, with a spinner and timer.
     generateBtn.addEventListener("click", async () => {
-      if (!pendingViews || busy) return;
-      const views = pendingViews;
-      const V = views.length;
+      if (!pendingSources || busy) return;
+      const V = pendingSources.length;
+      const RES = resFor(V);
+      const P = RES * RES;
       const pref = backendSel.value;
       const runNo = ++runCounter;
       const timings = {};
       const tRun = performance.now();
       // Written before any heavy work, so a crash leaves this line behind.
-      log("info", `run ${runNo} start`, { V, pref, res: RES, jsHeap: memSnap() });
+      log("info", `run ${runNo} start`, { V, pref, res: resFor(V), jsHeap: memSnap() });
 
       setBusy(true);
       try {
@@ -735,11 +749,12 @@
         showWorking("Preparing…");
 
         let t = performance.now();
-        const input = buildInput(views);
+        const views = pendingSources.map((src) => toView(src, RES));
+        const input = buildInput(views, RES, P);
         timings.inputBuildMs = round(performance.now() - t);
 
         showWorking("Loading model…");
-        const reply = await callWorker({ type: "run", input, V, prefer: pref }, [input.buffer], (m) => {
+        const reply = await callWorker({ type: "run", input, V, res: RES, prefer: pref }, [input.buffer], (m) => {
           if (m.phase === "infer") setPhase(`Running the model on ${V} view${V > 1 ? "s" : ""}…`);
           else if (m.total !== undefined) setPhase(`Loading model… ${mb(m.done)}${m.total ? " / " + mb(m.total) : ""} MB.`);
         });
@@ -750,7 +765,7 @@
         hideWorking();
         setStatus("Model finished. Building point cloud…");
         t = performance.now();
-        cloud = buildCloud(views, reply.result);
+        cloud = buildCloud(views, reply.result, RES, P);
         timings.buildCloudMs = round(performance.now() - t);
         if (cloud.dropped) log("warn", `run ${runNo}: dropped non-finite points`, { dropped: cloud.dropped });
 
