@@ -157,7 +157,7 @@
     import { OrbitControls } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js";
 
     // ---------- constants ----------
-    const BUILD = "debug-5";
+    const BUILD = "debug-6";
     // Must match --res passed to tools/export_onnx.py. One view or two use the
     // full 504 model; three or more use the 336 model, because attention memory
     // grows with (views x tokens)^2 and phones run out of memory at 504.
@@ -166,9 +166,8 @@
     const resFor = (V) => (V >= 2 ? RES_MULTI : RES_FULL);
     // Peak memory measured on the CPU backend: 1 view at 504 px ~820 MB (worked on
     // iPhone), 3 views at 336 px ~870 MB, 5 views at 336 px ~1200 MB (killed on iPhone).
-    // WebGPU keeps its memory on the GPU, so it gets the full cap.
-    const CPU_MAX_VIEWS = 3;
-    const maxViewsFor = (pref) => (pref === "cpu" ? CPU_MAX_VIEWS : MAX_VIEWS);
+    // WebGPU (Auto) also died at 5 views on iPhone, so every backend uses the same cap.
+    const MAX_RUN_VIEWS = 3;
     const MAX_VIEWS = 8;
     const MAX_POINTS = 600000;
     const PAD_GREY = "#808080";
@@ -739,7 +738,7 @@
     generateBtn.addEventListener("click", async () => {
       if (!pendingSources || busy) return;
       const pref = backendSel.value;
-      const cap = maxViewsFor(pref);
+      const cap = MAX_RUN_VIEWS;
       const sources = pendingSources.length > cap ? sampleEvenly(pendingSources, cap) : pendingSources;
       if (sources.length < pendingSources.length) {
         log("warn", "too many photos for this backend, using a subset", { picked: pendingSources.length, used: sources.length, pref });
