@@ -12,7 +12,7 @@ importScripts("https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.min.
 ort.env.wasm.numThreads = 1;
 ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/";
 
-const WORKER_BUILD = "debug-13";
+const WORKER_BUILD = "debug-14";
 // One model with dynamic views, height and width (multiples of 14). The page
 // sends images at their own aspect ratio, as the upstream preprocessing does.
 const MODELS = { dyn: "model/da3-small-dyn-fp16.onnx" };

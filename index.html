@@ -161,7 +161,7 @@
     import { OrbitControls } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js";
 
     // ---------- constants ----------
-    const BUILD = "debug-13";
+    const BUILD = "debug-14";
     // Input size is the photo's longest side; the other side follows the photo's
     // own aspect ratio (no padding), both rounded to multiples of 14, as the
     // upstream preprocessing does. One model handles every size.
@@ -583,7 +583,9 @@
       cv.width = W; cv.height = H;
       const ctx = cv.getContext("2d", { willReadFrequently: true });
       ctx.drawImage(src, (src.width - cw) / 2, (src.height - ch) / 2, cw, ch, 0, 0, W, H);
-      return { rgba: ctx.getImageData(0, 0, W, H).data };
+      // Model pixels per original pixel, per axis. Rounding to multiples of 14
+      // can stretch one axis slightly; the intrinsics below account for it.
+      return { rgba: ctx.getImageData(0, 0, W, H).data, sx: W / cw, sy: H / ch };
     }
 
     function makeThumb(src) {
@@ -617,13 +619,39 @@
     // cloud sits upright in three.js (y up, z toward the viewer).
     // Points with non-finite coordinates are dropped and counted, because a
     // single NaN makes a whole view invisible.
+    // The model predicts focal lengths per view and per axis that disagree by a
+    // few percent, though the photos come from one camera with square pixels.
+    // A focal error leaves the image centre in place but shifts the edges, so
+    // overlapping views doubled up at the edges. Use one focal length F in
+    // original-photo pixels for all views (median of the model's estimates),
+    // map it through each view's resize scale, and centre the principal point.
+    // Measured on phone photos: smaller gap between views than the model's K.
+    function physicalIntrinsics(views, Kraw, H, W) {
+      const V = views.length;
+      const est = [];
+      for (let v = 0; v < V; v++) {
+        const k = v * 9;
+        est.push(Math.sqrt((Kraw[k] / views[v].sx) * (Kraw[k + 4] / views[v].sy)));
+      }
+      est.sort((a, b) => a - b);
+      const F = V % 2 ? est[(V - 1) / 2] : (est[V / 2 - 1] + est[V / 2]) / 2;
+      const K = new Float32Array(V * 9);
+      for (let v = 0; v < V; v++) {
+        const k = v * 9;
+        K[k] = views[v].sx * F; K[k + 4] = views[v].sy * F;
+        K[k + 2] = W / 2; K[k + 5] = H / 2; K[k + 8] = 1;
+      }
+      return { K, F, modelF: est };
+    }
+
     function buildCloud(views, out, H, W, cleanup) {
       const V = views.length;
       const P = H * W;
       const depth = out.depth;
       const conf = out.depth_conf;
       const ext = out.extrinsics;
-      const K = out.intrinsics;
+      const intr = physicalIntrinsics(views, out.intrinsics, H, W);
+      const K = intr.K;
       const N = V * P;
       const pos = new Float32Array(N * 3);
       const col = new Float32Array(N * 3);
@@ -704,7 +732,8 @@
         }
       }
       sample.sort((a, b) => a - b);
-      return { pos, col, cf, valid, N, sortedConf: sample, dropped, edgeDropped, mergedDropped };
+      return { pos, col, cf, valid, N, sortedConf: sample, dropped, edgeDropped, mergedDropped,
+               focal: { shared: Math.round(intr.F), perView: intr.modelF.map(Math.round) } };
     }
 
     function applyFilter(fitView) {
@@ -874,7 +903,7 @@
         t = performance.now();
         lastRun = { views, out: reply.result, H, W };
         cloud = buildCloud(views, reply.result, H, W, cleanupEl.checked);
-        log("info", `run ${runNo} cleanup`, { on: cleanupEl.checked, edgeDropped: cloud.edgeDropped, mergedDropped: cloud.mergedDropped });
+        log("info", `run ${runNo} cleanup`, { on: cleanupEl.checked, edgeDropped: cloud.edgeDropped, mergedDropped: cloud.mergedDropped, focalPx: cloud.focal });
         timings.buildCloudMs = round(performance.now() - t);
         if (cloud.dropped) log("warn", `run ${runNo}: dropped non-finite points`, { dropped: cloud.dropped });
 
