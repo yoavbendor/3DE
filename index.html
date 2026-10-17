@@ -127,7 +127,7 @@
         <input type="range" id="keep" min="5" max="100" value="60">
       </label>
       <label class="muted" for="cleanup" style="flex-direction:row;align-items:center;gap:8px">
-        <input type="checkbox" id="cleanup" checked> Clean up edges and overlapping views
+        <input type="checkbox" id="cleanup" checked> Clean up (one shared camera, edges, overlapping views)
       </label>
       <label for="size">Point size: <span><b id="sizeVal">4</b></span>
         <input type="range" id="size" min="1" max="12" value="4">
@@ -161,7 +161,7 @@
     import { OrbitControls } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js";
 
     // ---------- constants ----------
-    const BUILD = "debug-14";
+    const BUILD = "debug-17";
     // Input size is the photo's longest side; the other side follows the photo's
     // own aspect ratio (no padding), both rounded to multiples of 14, as the
     // upstream preprocessing does. One model handles every size.
@@ -573,16 +573,37 @@
       return { W: round14(src.width), H: round14(src.height) };
     }
 
+    // Downscale a region of a photo to W x H without aliasing. A single canvas
+    // drawImage from ~2000 px to ~400 px samples bilinearly and aliases, and the
+    // model reacts to that (its focal estimate moved by ~15% versus a filtered
+    // resize). Halving in steps with smoothing approximates the filtered
+    // (PIL-style) resize the upstream preprocessing uses.
+    function drawFiltered(src, sx0, sy0, sw, sh, W, H) {
+      let cur = src, cx = sx0, cy = sy0, cw = sw, ch = sh;
+      while (cw / 2 >= W && ch / 2 >= H) {
+        const nw = Math.round(cw / 2), nh = Math.round(ch / 2);
+        const c = document.createElement("canvas");
+        c.width = nw; c.height = nh;
+        const g = c.getContext("2d");
+        g.imageSmoothingEnabled = true; g.imageSmoothingQuality = "high";
+        g.drawImage(cur, cx, cy, cw, ch, 0, 0, nw, nh);
+        cur = c; cx = 0; cy = 0; cw = nw; ch = nh;
+      }
+      const out = document.createElement("canvas");
+      out.width = W; out.height = H;
+      const ctx = out.getContext("2d", { willReadFrequently: true });
+      ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = "high";
+      ctx.drawImage(cur, cx, cy, cw, ch, 0, 0, W, H);
+      return ctx;
+    }
+
     // Resize a photo to W x H. Photos with another aspect ratio than the first
     // one are centre-cropped to it first, because all views must share one size.
     function toView(src, W, H) {
       const want = W / H, have = src.width / src.height;
       let cw = src.width, ch = src.height;
       if (have > want) cw = src.height * want; else ch = src.width / want;
-      const cv = document.createElement("canvas");
-      cv.width = W; cv.height = H;
-      const ctx = cv.getContext("2d", { willReadFrequently: true });
-      ctx.drawImage(src, (src.width - cw) / 2, (src.height - ch) / 2, cw, ch, 0, 0, W, H);
+      const ctx = drawFiltered(src, (src.width - cw) / 2, (src.height - ch) / 2, cw, ch, W, H);
       // Model pixels per original pixel, per axis. Rounding to multiples of 14
       // can stretch one axis slightly; the intrinsics below account for it.
       return { rgba: ctx.getImageData(0, 0, W, H).data, sx: W / cw, sy: H / ch };
@@ -626,7 +647,72 @@
     // original-photo pixels for all views (median of the model's estimates),
     // map it through each view's resize scale, and centre the principal point.
     // Measured on phone photos: smaller gap between views than the model's K.
-    function physicalIntrinsics(views, Kraw, H, W) {
+    // All photos come from one camera at one setting, so they share one focal
+    // length. Pick the value that makes the views agree best: project a sample
+    // of each later view's points into the earlier views and take the median
+    // relative depth mismatch. Coarse sweep around the model's estimate, then
+    // fine. On the test photos this moved the best focal by -10% to +17% and
+    // cut the gap between views by up to 17%.
+    function calibrateFocal(views, out, H, W, F0) {
+      const V = views.length;
+      if (V < 2) return { factor: 1, residual: null };
+      const depth = out.depth, ext = out.extrinsics;
+      const P = H * W, cx = W / 2, cy = H / 2;
+      const step = Math.max(1, Math.round(Math.sqrt(P / 3000)));
+      const residual = (F) => {
+        const r = [];
+        for (let v = 1; v < V; v++) {
+          const e = v * 12, fxv = views[v].sx * F, fyv = views[v].sy * F;
+          for (let y = step >> 1; y < H; y += step) {
+            for (let x = step >> 1; x < W; x += step) {
+              const d = depth[v * P + y * W + x];
+              if (!(d > 0)) continue;
+              const ax = ((x - cx) / fxv) * d - ext[e + 3];
+              const ay = ((y - cy) / fyv) * d - ext[e + 7];
+              const az = d - ext[e + 11];
+              const wx = ext[e] * ax + ext[e + 4] * ay + ext[e + 8] * az;
+              const wy = ext[e + 1] * ax + ext[e + 5] * ay + ext[e + 9] * az;
+              const wz = ext[e + 2] * ax + ext[e + 6] * ay + ext[e + 10] * az;
+              for (let u = 0; u < v; u++) {
+                const eu = u * 12;
+                const zc = ext[eu + 8] * wx + ext[eu + 9] * wy + ext[eu + 10] * wz + ext[eu + 11];
+                if (!(zc > 1e-6)) continue;
+                const xc = ext[eu] * wx + ext[eu + 1] * wy + ext[eu + 2] * wz + ext[eu + 3];
+                const yc = ext[eu + 4] * wx + ext[eu + 5] * wy + ext[eu + 6] * wz + ext[eu + 7];
+                const px = Math.round((views[u].sx * F * xc) / zc + cx);
+                const py = Math.round((views[u].sy * F * yc) / zc + cy);
+                if (px < 0 || px >= W || py < 0 || py >= H) continue;
+                const du = depth[u * P + py * W + px];
+                if (!(du > 0)) continue;
+                const rel = Math.abs(zc - du) / du;
+                if (rel < 0.3) r.push(rel);
+              }
+            }
+          }
+        }
+        if (r.length < 200) return Infinity;
+        r.sort((a, b) => a - b);
+        return r[r.length >> 1];
+      };
+      const atModel = residual(F0);
+      let best = { factor: 1, residual: atModel };
+      for (let i = 0; i <= 14; i++) {
+        const f = 0.7 + 0.05 * i, res = residual(F0 * f);
+        if (res < best.residual) best = { factor: f, residual: res };
+      }
+      const centre = best.factor;
+      for (let i = -4; i <= 4; i++) {
+        const f = centre + 0.01 * i, res = residual(F0 * f);
+        if (res < best.residual) best = { factor: f, residual: res };
+      }
+      // Only move away from the model's focal when that clearly helps; a flat
+      // curve means the sample, not the geometry, picked the minimum.
+      if (!(best.residual < 0.97 * atModel)) return { factor: 1, residual: atModel, atModel };
+      return { ...best, atModel };
+    }
+
+    function physicalIntrinsics(views, out, H, W) {
+      const Kraw = out.intrinsics;
       const V = views.length;
       const est = [];
       for (let v = 0; v < V; v++) {
@@ -634,14 +720,16 @@
         est.push(Math.sqrt((Kraw[k] / views[v].sx) * (Kraw[k + 4] / views[v].sy)));
       }
       est.sort((a, b) => a - b);
-      const F = V % 2 ? est[(V - 1) / 2] : (est[V / 2 - 1] + est[V / 2]) / 2;
+      const F0 = V % 2 ? est[(V - 1) / 2] : (est[V / 2 - 1] + est[V / 2]) / 2;
+      const cal = calibrateFocal(views, out, H, W, F0);
+      const F = F0 * cal.factor;
       const K = new Float32Array(V * 9);
       for (let v = 0; v < V; v++) {
         const k = v * 9;
         K[k] = views[v].sx * F; K[k + 4] = views[v].sy * F;
         K[k + 2] = W / 2; K[k + 5] = H / 2; K[k + 8] = 1;
       }
-      return { K, F, modelF: est };
+      return { K, F, modelF: est, factor: cal.factor, residual: cal.residual, atModel: cal.atModel };
     }
 
     function buildCloud(views, out, H, W, cleanup) {
@@ -650,8 +738,9 @@
       const depth = out.depth;
       const conf = out.depth_conf;
       const ext = out.extrinsics;
-      const intr = physicalIntrinsics(views, out.intrinsics, H, W);
-      const K = intr.K;
+      // Clean-up off shows the model's raw cameras, for comparison.
+      const intr = cleanup ? physicalIntrinsics(views, out, H, W) : null;
+      const K = cleanup ? intr.K : out.intrinsics;
       const N = V * P;
       const pos = new Float32Array(N * 3);
       const col = new Float32Array(N * 3);
@@ -733,7 +822,10 @@
       }
       sample.sort((a, b) => a - b);
       return { pos, col, cf, valid, N, sortedConf: sample, dropped, edgeDropped, mergedDropped,
-               focal: { shared: Math.round(intr.F), perView: intr.modelF.map(Math.round) } };
+               focal: intr ? { shared: Math.round(intr.F), perView: intr.modelF.map(Math.round),
+                               calibration: Math.round(intr.factor * 100) / 100,
+                               residualPct: intr.residual == null ? null : Math.round(intr.residual * 10000) / 100,
+                               residualAtModelPct: intr.atModel == null ? null : Math.round(intr.atModel * 10000) / 100 } : "raw model" };
     }
 
     function applyFilter(fitView) {
